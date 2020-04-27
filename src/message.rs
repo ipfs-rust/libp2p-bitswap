@@ -57,8 +57,8 @@ impl BitswapMessage {
     }
 
     /// Returns the list of wanted blocks.
-    pub fn want(&self) -> impl Iterator<Item = (&Cid, &Priority)> {
-        self.want.iter()
+    pub fn want(&self) -> impl Iterator<Item = (&Cid, Priority)> {
+        self.want.iter().map(|(cid, priority)| (cid, *priority))
     }
 
     /// Returns the list of cancelled blocks.
@@ -98,7 +98,7 @@ impl BitswapMessage {
         for (cid, priority) in self.want() {
             let mut entry = bitswap_pb::message::wantlist::Entry::default();
             entry.block = cid.to_bytes();
-            entry.priority = *priority;
+            entry.priority = priority;
             wantlist.entries.push(entry);
         }
         for cid in self.cancel() {

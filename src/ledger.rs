@@ -40,7 +40,7 @@ impl Ledger {
             self.sent_want_list.remove(cid);
         }
         for (cid, priority) in self.message.want() {
-            self.sent_want_list.insert(cid.clone(), *priority);
+            self.sent_want_list.insert(cid.clone(), priority);
         }
         Some(core::mem::replace(&mut self.message, BitswapMessage::new()))
     }
@@ -51,14 +51,14 @@ impl Ledger {
             self.message.remove_block(cid);
         }
         for (cid, priority) in message.want() {
-            self.received_want_list.insert(cid.to_owned(), *priority);
+            self.received_want_list.insert(cid.to_owned(), priority);
         }
     }
 
-    pub fn wantlist<'a>(&'a self) -> impl Iterator<Item = (Cid, Priority)> + 'a {
+    pub fn wantlist<'a>(&'a self) -> impl Iterator<Item = (&Cid, Priority)> + 'a {
         self.received_want_list
             .iter()
-            .map(|(cid, priority)| (cid.clone(), *priority))
+            .map(|(cid, priority)| (cid, *priority))
     }
 }
 
@@ -74,8 +74,8 @@ mod tests {
         let mut ledger = Ledger::new();
         ledger.add_block(block_1);
         ledger.add_block(block_2);
-        ledger.send();
-        assert_eq!(ledger.sent_blocks, 2);
+        let message = ledger.send().unwrap();
+        assert_eq!(message.blocks().len(), 2);
     }
 
     #[test]
@@ -86,11 +86,11 @@ mod tests {
         ledger.add_block(block_1.clone());
         ledger.add_block(block_2);
 
-        let mut message = BitswapMessage::new();
-        message.cancel_block(block_1.cid());
-        ledger.receive(&message);
-        ledger.send();
-        assert_eq!(ledger.sent_blocks, 1);
+        let mut cancel = BitswapMessage::new();
+        cancel.cancel_block(block_1.cid());
+        ledger.receive(&cancel);
+        let message = ledger.send().unwrap();
+        assert_eq!(message.blocks().len(), 1);
     }
 
     #[test]
@@ -101,10 +101,9 @@ mod tests {
         ledger.want(&block_1.cid(), 1);
         ledger.want(&block_2.cid(), 1);
         ledger.cancel(&block_1.cid());
-        ledger.send();
-        let mut want_list = HashMap::new();
-        want_list.insert(block_2.cid().clone(), 1);
-        assert_eq!(ledger.sent_want_list, want_list);
+        let message = ledger.send().unwrap();
+        let mut want_list = message.want();
+        assert_eq!(want_list.next(), Some((block_2.cid(), 1)));
     }
 
     #[test]
@@ -125,22 +124,17 @@ mod tests {
     #[test]
     fn test_ledger_receive() {
         let block_1 = create_block(b"1");
-        let block_2 = create_block(b"2");
         let mut message = BitswapMessage::new();
-        message.add_block(block_1);
-        message.want_block(&block_2.cid().clone(), 1);
+        message.want_block(&block_1.cid().clone(), 1);
 
         let mut ledger = Ledger::new();
         ledger.receive(&message);
 
-        assert_eq!(ledger.received_blocks, 1);
-        let mut want_list = HashMap::new();
-        want_list.insert(block_2.cid().clone(), 1);
-        assert_eq!(ledger.received_want_list, want_list);
+        assert_eq!(ledger.wantlist().next(), Some((block_1.cid(), 1)));
 
         let mut message = BitswapMessage::new();
-        message.cancel_block(&block_2.cid());
+        message.cancel_block(&block_1.cid());
         ledger.receive(&message);
-        assert_eq!(ledger.received_want_list, HashMap::new());
+        assert_eq!(ledger.wantlist().next(), None);
     }
 }

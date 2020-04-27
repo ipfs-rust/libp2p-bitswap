@@ -118,7 +118,12 @@ impl Bitswap {
         if let Some(peer_id) = peer_id {
             self.connected_peers
                 .get(peer_id)
-                .map(|ledger| ledger.wantlist().collect())
+                .map(|ledger| {
+                    ledger
+                        .wantlist()
+                        .map(|(cid, priority)| (cid.clone(), priority))
+                        .collect()
+                })
                 .unwrap_or_default()
         } else {
             self.wanted_blocks
@@ -184,7 +189,7 @@ impl NetworkBehaviour for Bitswap {
                 .push_back(NetworkBehaviourAction::GenerateEvent(event));
         }
         for (cid, priority) in message.want() {
-            let event = BitswapEvent::ReceivedWant(peer_id.clone(), cid.clone(), *priority);
+            let event = BitswapEvent::ReceivedWant(peer_id.clone(), cid.clone(), priority);
             self.events
                 .push_back(NetworkBehaviourAction::GenerateEvent(event));
         }
