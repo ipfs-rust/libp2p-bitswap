@@ -3,6 +3,9 @@ name = "libp2p-bitswap"
 version = "0.1.0"
 authors = ["David Craven <david@craven.ch>"]
 edition = "2018"
+description = "Implementation of the ipfs bitswap protocol."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ipfs-rust/libp2p-bitswap"
 
 [build-dependencies]
 prost-build = "0.6.1"
