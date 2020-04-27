@@ -4,6 +4,7 @@ mod block;
 mod error;
 mod ledger;
 mod message;
+mod prefix;
 mod protocol;
 
 pub use crate::behaviour::{Bitswap, BitswapEvent};

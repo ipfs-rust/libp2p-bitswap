@@ -1,7 +1,8 @@
 use crate::block::Block;
 use crate::error::BitswapError;
+use crate::prefix::Prefix;
 use core::convert::TryFrom;
-use libipld::cid::{Cid, Prefix};
+use libipld::cid::Cid;
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 
@@ -108,7 +109,8 @@ impl BitswapMessage {
         }
         for block in self.blocks() {
             let mut payload = bitswap_pb::message::Block::default();
-            payload.prefix = block.cid().prefix().as_bytes();
+            let prefix: Prefix = block.cid().into();
+            payload.prefix = prefix.to_bytes();
             payload.data = block.data().to_vec();
             proto.payload.push(payload);
         }
@@ -143,8 +145,8 @@ impl TryFrom<&[u8]> for BitswapMessage {
             }
         }
         for payload in proto.payload {
-            let prefix = Prefix::new_from_bytes(&payload.prefix)?;
-            let cid = Cid::new_from_prefix(&prefix, &payload.data);
+            let prefix = Prefix::new(&payload.prefix)?;
+            let cid = prefix.to_cid(&payload.data)?;
             let block = Block {
                 cid,
                 data: payload.data.to_vec().into_boxed_slice(),

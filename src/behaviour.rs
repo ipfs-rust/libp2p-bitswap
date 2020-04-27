@@ -13,9 +13,12 @@ use fnv::FnvHashSet;
 use futures::task::Context;
 use futures::task::Poll;
 use libipld::cid::Cid;
-use libp2p_core::{ConnectedPoint, Multiaddr, PeerId};
+use libp2p_core::connection::ConnectionId;
+use libp2p_core::{Multiaddr, PeerId};
 use libp2p_swarm::protocols_handler::{IntoProtocolsHandler, OneShotHandler, ProtocolsHandler};
-use libp2p_swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters};
+use libp2p_swarm::{
+    DialPeerCondition, NetworkBehaviour, NetworkBehaviourAction, NotifyHandler, PollParameters,
+};
 use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,8 +60,10 @@ impl Bitswap {
             return;
         }
         log::trace!("  queuing dial_peer to {}", peer_id.to_base58());
-        self.events
-            .push_back(NetworkBehaviourAction::DialPeer { peer_id });
+        self.events.push_back(NetworkBehaviourAction::DialPeer {
+            peer_id,
+            condition: DialPeerCondition::NotDialing,
+        });
     }
 
     /// Sends a block to the peer.
@@ -147,27 +152,24 @@ impl NetworkBehaviour for Bitswap {
         Default::default()
     }
 
-    fn inject_connected(&mut self, peer_id: PeerId, cp: ConnectedPoint) {
-        log::trace!("bitswap: inject_connected");
-        log::trace!("  peer_id: {}", peer_id.to_base58());
-        log::trace!("  connected_point: {:?}", cp);
+    fn inject_connected(&mut self, peer_id: &PeerId) {
+        log::trace!("bitswap: inject_connected {}", peer_id.to_base58());
         let ledger = Ledger::new();
         self.connected_peers.insert(peer_id.clone(), ledger);
-        self.send_want_list(&peer_id);
-        log::trace!("");
+        self.send_want_list(peer_id);
     }
 
-    fn inject_disconnected(&mut self, peer_id: &PeerId, cp: ConnectedPoint) {
-        log::trace!("bitswap: inject_disconnected {:?}", cp);
-        log::trace!("  peer_id: {}", peer_id.to_base58());
-        log::trace!("  connected_point: {:?}", cp);
-        log::trace!("");
+    fn inject_disconnected(&mut self, peer_id: &PeerId) {
+        log::trace!("bitswap: inject_disconnected {}", peer_id.to_base58());
         self.connected_peers.remove(peer_id);
     }
 
-    fn inject_node_event(&mut self, peer_id: PeerId, message: BitswapMessage) {
-        log::trace!("bitswap: inject_node_event");
-        log::trace!("  received message");
+    fn inject_event(&mut self, peer_id: PeerId, connection: ConnectionId, message: BitswapMessage) {
+        log::trace!(
+            "bitswap: inject_event {} {:?}",
+            peer_id.to_base58(),
+            connection
+        );
         log::trace!("{:?}", message);
 
         // Update the ledger.
@@ -202,8 +204,9 @@ impl NetworkBehaviour for Bitswap {
         }
         for (peer_id, ledger) in &mut self.connected_peers {
             if let Some(message) = ledger.send() {
-                return Poll::Ready(NetworkBehaviourAction::SendEvent {
+                return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
                     peer_id: peer_id.clone(),
+                    handler: NotifyHandler::Any,
                     event: message,
                 });
             }
