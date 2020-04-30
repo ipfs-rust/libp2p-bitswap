@@ -53,9 +53,9 @@ impl Bitswap {
 
     /// Connect to peer.
     ///
-    /// Called from Kademlia behaviour.
+    /// Called from discovery protocols like mdns or kademlia.
     pub fn connect(&mut self, peer_id: PeerId) {
-        log::trace!("bitswap: connect");
+        log::trace!("connect");
         if !self.target_peers.insert(peer_id.clone()) {
             return;
         }
@@ -70,18 +70,23 @@ impl Bitswap {
     ///
     /// Called from a Strategy.
     pub fn send_block(&mut self, peer_id: &PeerId, block: Block) {
-        log::trace!("bitswap: send_block");
-        log::trace!("  queuing block for {}", peer_id.to_base58());
+        log::trace!("send_block with cid {} to peer {}", block.cid.to_string(), peer_id.to_base58());
         self.ledger(peer_id).add_block(block);
+    }
+
+    /// Sends a block to all peers that sent a want.
+    pub fn send_block_all(&mut self, block: Block) {
+        for peer_id in self.peers_want(&block.cid) {
+            self.send_block(&peer_id, block.clone());
+        }
     }
 
     /// Sends the wantlist to the peer.
     fn send_want_list(&mut self, peer_id: &PeerId) {
-        log::trace!("bitswap: send_want_list");
+        log::trace!("send_want_list to peer {}", peer_id.to_base58());
         if self.wanted_blocks.is_empty() {
             return;
         }
-        log::trace!("  queuing wanted blocks");
         let ledger = self.connected_peers.get_mut(peer_id).unwrap();
         for (cid, priority) in &self.wanted_blocks {
             ledger.want(cid, *priority);
@@ -92,9 +97,8 @@ impl Bitswap {
     ///
     /// A user request
     pub fn want_block(&mut self, cid: Cid, priority: Priority) {
-        log::trace!("bitswap: want_block");
-        for (peer_id, ledger) in self.connected_peers.iter_mut() {
-            log::trace!("  queuing want for {}", peer_id.to_base58());
+        log::trace!("want_block with cid {} and priority {}", cid.to_string(), priority);
+        for (_peer_id, ledger) in self.connected_peers.iter_mut() {
             ledger.want(&cid, priority);
         }
         self.wanted_blocks.insert(cid, priority);
@@ -105,9 +109,8 @@ impl Bitswap {
     /// Can be either a user request or be called when the block
     /// was received.
     pub fn cancel_block(&mut self, cid: &Cid) {
-        log::trace!("bitswap: cancel_block");
-        for (peer_id, ledger) in self.connected_peers.iter_mut() {
-            log::trace!("  queuing cancel for {}", peer_id.to_base58());
+        log::trace!("cancel_block with cid {}", cid.to_string());
+        for (_peer_id, ledger) in self.connected_peers.iter_mut() {
             ledger.cancel(cid);
         }
         self.wanted_blocks.remove(cid);
@@ -141,6 +144,20 @@ impl Bitswap {
             .cloned()
             .collect()
     }
+
+    /// Retrieves the peers that want a block.
+    pub fn peers_want(&self, cid: &Cid) -> Vec<PeerId> {
+        self.connected_peers
+            .iter()
+            .filter_map(|(peer_id, ledger)| {
+                if ledger.peer_wants(cid) {
+                    Some(peer_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 impl NetworkBehaviour for Bitswap {
@@ -148,30 +165,28 @@ impl NetworkBehaviour for Bitswap {
     type OutEvent = BitswapEvent;
 
     fn new_handler(&mut self) -> Self::ProtocolsHandler {
-        log::trace!("bitswap: new_handler");
         Default::default()
     }
 
     fn addresses_of_peer(&mut self, _peer_id: &PeerId) -> Vec<Multiaddr> {
-        log::trace!("bitswap: addresses_of_peer");
         Default::default()
     }
 
     fn inject_connected(&mut self, peer_id: &PeerId) {
-        log::trace!("bitswap: inject_connected {}", peer_id.to_base58());
+        log::trace!("inject_connected {}", peer_id.to_base58());
         let ledger = Ledger::new();
         self.connected_peers.insert(peer_id.clone(), ledger);
         self.send_want_list(peer_id);
     }
 
     fn inject_disconnected(&mut self, peer_id: &PeerId) {
-        log::trace!("bitswap: inject_disconnected {}", peer_id.to_base58());
+        log::trace!("inject_disconnected {}", peer_id.to_base58());
         self.connected_peers.remove(peer_id);
     }
 
     fn inject_event(&mut self, peer_id: PeerId, connection: ConnectionId, message: BitswapMessage) {
         log::trace!(
-            "bitswap: inject_event {} {:?}",
+            "inject_event {} {:?}",
             peer_id.to_base58(),
             connection
         );
@@ -182,6 +197,10 @@ impl NetworkBehaviour for Bitswap {
 
         // Process incoming messages.
         for block in message.blocks() {
+            if !self.wanted_blocks.contains_key(&block.cid) {
+                log::info!("dropping block {}", block.cid.to_string());
+                continue;
+            }
             // Cancel the block.
             self.cancel_block(&block.cid());
             let event = BitswapEvent::ReceivedBlock(peer_id.clone(), block.clone());

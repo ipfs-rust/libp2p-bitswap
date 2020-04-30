@@ -20,6 +20,10 @@ impl Ledger {
         Self::default()
     }
 
+    pub fn peer_wants(&self, cid: &Cid) -> bool {
+        self.received_want_list.contains_key(cid)
+    }
+
     pub fn add_block(&mut self, block: Block) {
         self.message.add_block(block);
     }
