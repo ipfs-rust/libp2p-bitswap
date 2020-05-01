@@ -12,7 +12,7 @@ use crate::protocol::BitswapConfig;
 use fnv::FnvHashSet;
 use futures::task::Context;
 use futures::task::Poll;
-use libipld::cid::Cid;
+use libipld_core::cid::Cid;
 use libp2p_core::connection::ConnectionId;
 use libp2p_core::{Multiaddr, PeerId};
 use libp2p_swarm::protocols_handler::{IntoProtocolsHandler, OneShotHandler, ProtocolsHandler};
@@ -23,7 +23,7 @@ use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BitswapEvent {
-    ReceivedBlock(PeerId, Block),
+    ReceivedBlock(PeerId, Cid, Box<[u8]>),
     ReceivedWant(PeerId, Cid, Priority),
     ReceivedCancel(PeerId, Cid),
 }
@@ -69,15 +69,20 @@ impl Bitswap {
     /// Sends a block to the peer.
     ///
     /// Called from a Strategy.
-    pub fn send_block(&mut self, peer_id: &PeerId, block: Block) {
-        log::trace!("send_block with cid {} to peer {}", block.cid.to_string(), peer_id.to_base58());
-        self.ledger(peer_id).add_block(block);
+    pub fn send_block(&mut self, peer_id: &PeerId, cid: Cid, data: Box<[u8]>) {
+        log::trace!(
+            "send_block with cid {} to peer {}",
+            cid.to_string(),
+            peer_id.to_base58()
+        );
+        self.ledger(peer_id).add_block(Block { cid, data });
     }
 
     /// Sends a block to all peers that sent a want.
-    pub fn send_block_all(&mut self, block: Block) {
-        for peer_id in self.peers_want(&block.cid) {
-            self.send_block(&peer_id, block.clone());
+    pub fn send_block_all(&mut self, cid: &Cid, data: &[u8]) {
+        let peers: Vec<_> = self.peers_want(cid).cloned().collect();
+        for peer_id in &peers {
+            self.send_block(&peer_id, cid.clone(), data.to_vec().into_boxed_slice());
         }
     }
 
@@ -97,7 +102,11 @@ impl Bitswap {
     ///
     /// A user request
     pub fn want_block(&mut self, cid: Cid, priority: Priority) {
-        log::trace!("want_block with cid {} and priority {}", cid.to_string(), priority);
+        log::trace!(
+            "want_block with cid {} and priority {}",
+            cid.to_string(),
+            priority
+        );
         for (_peer_id, ledger) in self.connected_peers.iter_mut() {
             ledger.want(&cid, priority);
         }
@@ -137,26 +146,21 @@ impl Bitswap {
     }
 
     /// Retrieves the connected bitswap peers.
-    pub fn peers(&self) -> Vec<PeerId> {
-        self.connected_peers
-            .iter()
-            .map(|(peer_id, _)| peer_id)
-            .cloned()
-            .collect()
+    pub fn peers<'a>(&'a self) -> impl Iterator<Item = &'a PeerId> + 'a {
+        self.connected_peers.iter().map(|(peer_id, _)| peer_id)
     }
 
     /// Retrieves the peers that want a block.
-    pub fn peers_want(&self, cid: &Cid) -> Vec<PeerId> {
+    pub fn peers_want<'a>(&'a self, cid: &'a Cid) -> impl Iterator<Item = &'a PeerId> + 'a {
         self.connected_peers
             .iter()
-            .filter_map(|(peer_id, ledger)| {
+            .filter_map(move |(peer_id, ledger)| {
                 if ledger.peer_wants(cid) {
-                    Some(peer_id.clone())
+                    Some(peer_id)
                 } else {
                     None
                 }
             })
-            .collect()
     }
 }
 
@@ -184,26 +188,27 @@ impl NetworkBehaviour for Bitswap {
         self.connected_peers.remove(peer_id);
     }
 
-    fn inject_event(&mut self, peer_id: PeerId, connection: ConnectionId, message: BitswapMessage) {
-        log::trace!(
-            "inject_event {} {:?}",
-            peer_id.to_base58(),
-            connection
-        );
+    fn inject_event(
+        &mut self,
+        peer_id: PeerId,
+        connection: ConnectionId,
+        mut message: BitswapMessage,
+    ) {
+        log::trace!("inject_event {} {:?}", peer_id.to_base58(), connection);
         log::trace!("{:?}", message);
 
         // Update the ledger.
         self.ledger(&peer_id).receive(&message);
 
         // Process incoming messages.
-        for block in message.blocks() {
-            if !self.wanted_blocks.contains_key(&block.cid) {
-                log::info!("dropping block {}", block.cid.to_string());
+        while let Some(Block { cid, data }) = message.pop_block() {
+            if !self.wanted_blocks.contains_key(&cid) {
+                log::info!("dropping block {}", cid.to_string());
                 continue;
             }
             // Cancel the block.
-            self.cancel_block(&block.cid());
-            let event = BitswapEvent::ReceivedBlock(peer_id.clone(), block.clone());
+            self.cancel_block(&cid);
+            let event = BitswapEvent::ReceivedBlock(peer_id.clone(), cid, data);
             self.events
                 .push_back(NetworkBehaviourAction::GenerateEvent(event));
         }
@@ -284,8 +289,11 @@ mod tests {
         let (mut tx, mut rx) = mpsc::channel::<Multiaddr>(1);
         Swarm::listen_on(&mut swarm1, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
 
-        let block = create_block(b"hello world");
-        let cid = block.cid().clone();
+        let Block {
+            cid: cid_orig,
+            data: data_orig,
+        } = create_block(b"hello world");
+        let cid = cid_orig.clone();
 
         let peer1 = async move {
             while let Some(_) = swarm1.next().now_or_never() {}
@@ -297,8 +305,8 @@ mod tests {
             loop {
                 match swarm1.next().await {
                     BitswapEvent::ReceivedWant(peer_id, cid, _) => {
-                        if &cid == block.cid() {
-                            swarm1.send_block(&peer_id, block.clone());
+                        if &cid == &cid_orig {
+                            swarm1.send_block(&peer_id, cid_orig.clone(), data_orig.clone());
                         }
                     }
                     _ => {}
@@ -312,7 +320,7 @@ mod tests {
 
             loop {
                 match swarm2.next().await {
-                    BitswapEvent::ReceivedBlock(_, block) => return block,
+                    BitswapEvent::ReceivedBlock(_, _, data) => return data,
                     _ => {}
                 }
             }
@@ -322,6 +330,6 @@ mod tests {
             .await
             .factor_first()
             .0;
-        assert_eq!(block.data(), b"hello world");
+        assert_eq!(&block[..], b"hello world");
     }
 }

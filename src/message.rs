@@ -2,7 +2,7 @@ use crate::block::Block;
 use crate::error::BitswapError;
 use crate::prefix::Prefix;
 use core::convert::TryFrom;
-use libipld::cid::Cid;
+use libipld_core::cid::Cid;
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 
@@ -54,6 +54,11 @@ impl BitswapMessage {
     /// Returns the list of blocks.
     pub fn blocks(&self) -> &[Block] {
         &self.blocks
+    }
+
+    /// Pops a block from the message.
+    pub fn pop_block(&mut self) -> Option<Block> {
+        self.blocks.pop()
     }
 
     /// Returns the list of wanted blocks.

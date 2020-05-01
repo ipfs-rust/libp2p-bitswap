@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 
-use libipld::cid::{self, Cid, Codec, Version};
-use multihash::Code;
+use libipld_core::cid::{self, Cid, Codec, Version};
+use libipld_core::multihash::{self, Code};
 use unsigned_varint::{decode as varint_decode, encode as varint_encode};
 
 /// Prefix represents all metadata of a CID, without the actual content.
@@ -27,8 +27,8 @@ impl Prefix {
         let codec = Codec::try_from(raw_codec)?;
 
         let (raw_mh_type, remain) = varint_decode::u64(remain)?;
-        let mh_type = match multihash::Code::from_u64(raw_mh_type) {
-            multihash::Code::Custom(_) => return Err(cid::Error::UnknownCodec),
+        let mh_type = match Code::from_u64(raw_mh_type) {
+            Code::Custom(_) => return Err(cid::Error::UnknownCodec),
             code => code,
         };
 

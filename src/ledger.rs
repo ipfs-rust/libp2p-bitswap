@@ -1,6 +1,6 @@
 use crate::block::Block;
 use crate::message::{BitswapMessage, Priority};
-use libipld::cid::Cid;
+use libipld_core::cid::Cid;
 use std::collections::HashMap;
 
 /// The Ledger contains the history of transactions with a peer.

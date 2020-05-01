@@ -1,6 +1,6 @@
 [package]
 name = "libp2p-bitswap"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["David Craven <david@craven.ch>"]
 edition = "2018"
 description = "Implementation of the ipfs bitswap protocol."
@@ -11,18 +11,15 @@ repository = "https://github.com/ipfs-rust/libp2p-bitswap"
 prost-build = "0.6.1"
 
 [dependencies]
-anyhow = "1.0.28"
 async-std = { version = "1.5.0", features = ["attributes"] }
-async-trait = "0.1.30"
 fnv = "1.0.6"
 futures = "0.3.4"
-libipld = "0.1.0"
+libipld-core = "0.1.0"
 libp2p-core = "0.18.0"
 libp2p-swarm = "0.18.1"
 log = "0.4.8"
-multihash = "0.10.1"
 prost = "0.6.1"
-thiserror = "1.0.15"
+thiserror = "1.0.16"
 unsigned-varint = "0.3.3"
 
 [dev-dependencies]
