@@ -1094,8 +1094,6 @@ dependencies = [
  "futures",
  "libipld-core",
  "libp2p",
- "libp2p-core",
- "libp2p-swarm",
  "log",
  "prost",
  "prost-build",

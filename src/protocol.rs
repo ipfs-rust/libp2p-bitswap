@@ -9,7 +9,7 @@ use core::future::Future;
 use core::iter;
 use core::pin::Pin;
 use futures::io::{AsyncRead, AsyncWrite};
-use libp2p_core::{upgrade, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
+use libp2p::core::{upgrade, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use std::io;
 
 // Undocumented, but according to JS we our messages have a max size of 512*1024
@@ -83,7 +83,7 @@ mod tests {
     use super::*;
     use async_std::net::{TcpListener, TcpStream};
     use futures::prelude::*;
-    use libp2p_core::upgrade;
+    use libp2p::core::upgrade;
 
     #[async_std::test]
     async fn test_upgrade() {

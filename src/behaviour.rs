@@ -13,10 +13,10 @@ use fnv::FnvHashSet;
 use futures::task::Context;
 use futures::task::Poll;
 use libipld_core::cid::Cid;
-use libp2p_core::connection::ConnectionId;
-use libp2p_core::{Multiaddr, PeerId};
-use libp2p_swarm::protocols_handler::{IntoProtocolsHandler, OneShotHandler, ProtocolsHandler};
-use libp2p_swarm::{
+use libp2p::core::connection::ConnectionId;
+use libp2p::core::{Multiaddr, PeerId};
+use libp2p::swarm::protocols_handler::{IntoProtocolsHandler, OneShotHandler, ProtocolsHandler};
+use libp2p::swarm::{
     DialPeerCondition, NetworkBehaviour, NetworkBehaviourAction, NotifyHandler, PollParameters,
 };
 use std::collections::{HashMap, VecDeque};
