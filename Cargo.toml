@@ -11,17 +11,17 @@ repository = "https://github.com/ipfs-rust/libp2p-bitswap"
 prost-build = "0.6.1"
 
 [dependencies]
-async-std = { version = "1.5.0", features = ["attributes"] }
+async-std = { version = "1.6.2", features = ["attributes"] }
 fnv = "1.0.7"
 futures = "0.3.5"
 libipld-core = "0.3.0"
-libp2p-core = "0.19.0"
-libp2p-swarm = "0.19.0"
+libp2p-core = "0.20.0"
+libp2p-swarm = "0.20.1"
 log = "0.4.8"
 prost = "0.6.1"
-thiserror = "1.0.19"
+thiserror = "1.0.20"
 unsigned-varint = "0.3.3"
 
 [dev-dependencies]
 env_logger = "0.7.1"
-libp2p = "0.19.0"
+libp2p = "0.21.1"
