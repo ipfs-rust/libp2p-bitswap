@@ -1,4 +1,4 @@
-use libipld_core::cid::Cid;
+use cid::Cid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Block {
@@ -23,12 +23,12 @@ impl Block {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use libipld_core::cid::Codec;
-    use libipld_core::multihash::Sha2_256;
+    use cid::RAW;
+    use multihash::{Multihash, MultihashDigest, SHA2_256};
 
     pub fn create_block(bytes: &[u8]) -> Block {
-        let digest = Sha2_256::digest(bytes);
-        let cid = Cid::new_v1(Codec::Raw, digest);
+        let digest = Multihash::new(SHA2_256, bytes).unwrap().to_raw().unwrap();
+        let cid = Cid::new_v1(RAW, digest);
         Block::new(bytes.to_vec().into_boxed_slice(), cid)
     }
 }

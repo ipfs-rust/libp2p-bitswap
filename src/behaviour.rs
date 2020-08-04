@@ -9,16 +9,17 @@ use crate::block::Block;
 use crate::ledger::Ledger;
 use crate::message::{BitswapMessage, Priority};
 use crate::protocol::BitswapConfig;
+use cid::Cid;
 use fnv::FnvHashSet;
 use futures::task::Context;
 use futures::task::Poll;
-use libipld_core::cid::Cid;
 use libp2p::core::connection::ConnectionId;
 use libp2p::core::{Multiaddr, PeerId};
 use libp2p::swarm::protocols_handler::{IntoProtocolsHandler, OneShotHandler, ProtocolsHandler};
 use libp2p::swarm::{
     DialPeerCondition, NetworkBehaviour, NetworkBehaviourAction, NotifyHandler, PollParameters,
 };
+use multihash::MultihashDigest;
 use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,25 +30,35 @@ pub enum BitswapEvent {
 }
 
 /// Network behaviour that handles sending and receiving IPFS blocks.
-#[derive(Default)]
-pub struct Bitswap {
+pub struct Bitswap<MH = multihash::Multihash> {
     /// Queue of events to report to the user.
-    events: VecDeque<NetworkBehaviourAction<BitswapMessage, BitswapEvent>>,
+    events: VecDeque<NetworkBehaviourAction<BitswapMessage<MH>, BitswapEvent>>,
     /// List of peers to send messages to.
     target_peers: FnvHashSet<PeerId>,
     /// Ledger
-    connected_peers: HashMap<PeerId, Ledger>,
+    connected_peers: HashMap<PeerId, Ledger<MH>>,
     /// Wanted blocks
     wanted_blocks: HashMap<Cid, Priority>,
 }
 
-impl Bitswap {
+impl<MH> Default for Bitswap<MH> {
+    fn default() -> Self {
+        Self {
+            events: Default::default(),
+            target_peers: Default::default(),
+            connected_peers: Default::default(),
+            wanted_blocks: Default::default(),
+        }
+    }
+}
+
+impl<MH: MultihashDigest> Bitswap<MH> {
     /// Creates a new `Bitswap`.
     pub fn new() -> Self {
         Default::default()
     }
 
-    fn ledger(&mut self, peer_id: &PeerId) -> &mut Ledger {
+    fn ledger(&mut self, peer_id: &PeerId) -> &mut Ledger<MH> {
         self.connected_peers.get_mut(peer_id).unwrap()
     }
 
@@ -164,8 +175,9 @@ impl Bitswap {
     }
 }
 
-impl NetworkBehaviour for Bitswap {
-    type ProtocolsHandler = OneShotHandler<BitswapConfig, BitswapMessage, BitswapMessage>;
+impl<MH: MultihashDigest> NetworkBehaviour for Bitswap<MH> {
+    type ProtocolsHandler =
+        OneShotHandler<BitswapConfig<MH>, BitswapMessage<MH>, BitswapMessage<MH>>;
     type OutEvent = BitswapEvent;
 
     fn new_handler(&mut self) -> Self::ProtocolsHandler {
@@ -192,7 +204,7 @@ impl NetworkBehaviour for Bitswap {
         &mut self,
         peer_id: PeerId,
         connection: ConnectionId,
-        mut message: BitswapMessage,
+        mut message: BitswapMessage<MH>,
     ) {
         log::trace!("inject_event {} {:?}", peer_id.to_base58(), connection);
         log::trace!("{:?}", message);
@@ -258,6 +270,7 @@ mod tests {
     use libp2p::tcp::TcpConfig;
     use libp2p::yamux::Config as YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
+    use multihash::Multihash;
     use std::io::{Error, ErrorKind};
     use std::time::Duration;
 
@@ -281,10 +294,10 @@ mod tests {
         env_logger::init();
 
         let (peer1_id, trans) = mk_transport();
-        let mut swarm1 = Swarm::new(trans, Bitswap::new(), peer1_id.clone());
+        let mut swarm1 = Swarm::new(trans, Bitswap::<Multihash>::new(), peer1_id.clone());
 
         let (peer2_id, trans) = mk_transport();
-        let mut swarm2 = Swarm::new(trans, Bitswap::new(), peer2_id.clone());
+        let mut swarm2 = Swarm::new(trans, Bitswap::<Multihash>::new(), peer2_id.clone());
 
         let (mut tx, mut rx) = mpsc::channel::<Multiaddr>(1);
         Swarm::listen_on(&mut swarm1, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();

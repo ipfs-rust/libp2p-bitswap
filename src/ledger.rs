@@ -1,20 +1,31 @@
 use crate::block::Block;
 use crate::message::{BitswapMessage, Priority};
-use libipld_core::cid::Cid;
+use cid::Cid;
+use multihash::MultihashDigest;
 use std::collections::HashMap;
 
 /// The Ledger contains the history of transactions with a peer.
-#[derive(Debug, Default)]
-pub struct Ledger {
+#[derive(Debug)]
+pub struct Ledger<MH = multihash::Multihash> {
     /// The list of wanted blocks sent to the peer.
     sent_want_list: HashMap<Cid, Priority>,
     /// The list of wanted blocks received from the peer.
     received_want_list: HashMap<Cid, Priority>,
     /// Queued message.
-    message: BitswapMessage,
+    message: BitswapMessage<MH>,
 }
 
-impl Ledger {
+impl<MH> Default for Ledger<MH> {
+    fn default() -> Self {
+        Self {
+            sent_want_list: Default::default(),
+            received_want_list: Default::default(),
+            message: Default::default(),
+        }
+    }
+}
+
+impl<MH: MultihashDigest> Ledger<MH> {
     /// Creates a new `PeerLedger`.
     pub fn new() -> Self {
         Self::default()
@@ -36,7 +47,7 @@ impl Ledger {
         self.message.cancel_block(cid);
     }
 
-    pub fn send(&mut self) -> Option<BitswapMessage> {
+    pub fn send(&mut self) -> Option<BitswapMessage<MH>> {
         if self.message.is_empty() {
             return None;
         }
@@ -49,7 +60,7 @@ impl Ledger {
         Some(core::mem::replace(&mut self.message, BitswapMessage::new()))
     }
 
-    pub fn receive(&mut self, message: &BitswapMessage) {
+    pub fn receive(&mut self, message: &BitswapMessage<MH>) {
         for cid in message.cancel() {
             self.received_want_list.remove(cid);
             self.message.remove_block(cid);
@@ -70,12 +81,13 @@ impl Ledger {
 mod tests {
     use super::*;
     use crate::block::tests::create_block;
+    use multihash::Multihash;
 
     #[test]
     fn test_ledger_send_block() {
         let block_1 = create_block(b"1");
         let block_2 = create_block(b"2");
-        let mut ledger = Ledger::new();
+        let mut ledger = Ledger::<Multihash>::new();
         ledger.add_block(block_1);
         ledger.add_block(block_2);
         let message = ledger.send().unwrap();
@@ -86,11 +98,11 @@ mod tests {
     fn test_ledger_remove_block() {
         let block_1 = create_block(b"1");
         let block_2 = create_block(b"2");
-        let mut ledger = Ledger::new();
+        let mut ledger = Ledger::<Multihash>::new();
         ledger.add_block(block_1.clone());
         ledger.add_block(block_2);
 
-        let mut cancel = BitswapMessage::new();
+        let mut cancel = BitswapMessage::<Multihash>::new();
         cancel.cancel_block(block_1.cid());
         ledger.receive(&cancel);
         let message = ledger.send().unwrap();
@@ -101,7 +113,7 @@ mod tests {
     fn test_ledger_send_want() {
         let block_1 = create_block(b"1");
         let block_2 = create_block(b"2");
-        let mut ledger = Ledger::new();
+        let mut ledger = Ledger::<Multihash>::new();
         ledger.want(&block_1.cid(), 1);
         ledger.want(&block_2.cid(), 1);
         ledger.cancel(&block_1.cid());
@@ -114,7 +126,7 @@ mod tests {
     fn test_ledger_send_cancel() {
         let block_1 = create_block(b"1");
         let block_2 = create_block(b"2");
-        let mut ledger = Ledger::new();
+        let mut ledger = Ledger::<Multihash>::new();
         ledger.want(&block_1.cid(), 1);
         ledger.want(&block_2.cid(), 1);
         ledger.send();
@@ -128,15 +140,15 @@ mod tests {
     #[test]
     fn test_ledger_receive() {
         let block_1 = create_block(b"1");
-        let mut message = BitswapMessage::new();
+        let mut message = BitswapMessage::<Multihash>::new();
         message.want_block(&block_1.cid().clone(), 1);
 
-        let mut ledger = Ledger::new();
+        let mut ledger = Ledger::<Multihash>::new();
         ledger.receive(&message);
 
         assert_eq!(ledger.wantlist().next(), Some((block_1.cid(), 1)));
 
-        let mut message = BitswapMessage::new();
+        let mut message = BitswapMessage::<Multihash>::new();
         message.cancel_block(&block_1.cid());
         ledger.receive(&message);
         assert_eq!(ledger.wantlist().next(), None);

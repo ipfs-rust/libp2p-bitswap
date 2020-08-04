@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 
-use libipld_core::cid::{self, Cid, Codec, Version};
-use libipld_core::multihash::{self, Code};
+use cid::{self, Cid, Version};
+use multihash::MultihashDigest;
 use unsigned_varint::{decode as varint_decode, encode as varint_encode};
 
 /// Prefix represents all metadata of a CID, without the actual content.
@@ -10,9 +10,9 @@ pub struct Prefix {
     /// The version of CID.
     pub version: Version,
     /// The codec of CID.
-    pub codec: Codec,
+    pub codec: u64,
     /// The multihash type of CID.
-    pub mh_type: Code,
+    pub mh_type: u64,
     /// The multihash length of CID.
     pub mh_len: usize,
 }
@@ -22,13 +22,8 @@ impl Prefix {
     pub fn new(data: &[u8]) -> Result<Prefix, cid::Error> {
         let (raw_version, remain) = varint_decode::u64(data)?;
         let version = Version::try_from(raw_version)?;
-
-        let (raw_codec, remain) = varint_decode::u64(remain)?;
-        let codec = Codec::try_from(raw_codec)?;
-
-        let (raw_mh_type, remain) = varint_decode::u64(remain)?;
-        let mh_type = Code::try_from(raw_mh_type)?;
-
+        let (codec, remain) = varint_decode::u64(remain)?;
+        let (mh_type, remain) = varint_decode::u64(remain)?;
         let (mh_len, _remain) = varint_decode::usize(remain)?;
 
         Ok(Prefix {
@@ -60,12 +55,9 @@ impl Prefix {
     }
 
     /// Create a CID out of the prefix and some data that will be hashed
-    pub fn to_cid(&self, data: &[u8]) -> Result<Cid, cid::Error> {
-        let mut hash = self.mh_type.digest(data);
-        if self.mh_len < hash.digest().len() {
-            hash = multihash::wrap(hash.algorithm(), &hash.digest()[..self.mh_len]);
-        }
-        Cid::new(self.version, self.codec, hash)
+    pub fn to_cid<M: MultihashDigest>(&self, data: &[u8]) -> Result<Cid, cid::Error> {
+        let mh = M::new(self.mh_type, data)?.to_raw()?;
+        Cid::new(self.version, self.codec, mh)
     }
 }
 
@@ -74,7 +66,7 @@ impl From<&Cid> for Prefix {
         Self {
             version: cid.version(),
             codec: cid.codec(),
-            mh_type: cid.hash().algorithm(),
+            mh_type: cid.hash().code(),
             mh_len: cid.hash().digest().len(),
         }
     }
