@@ -11,15 +11,27 @@ use core::pin::Pin;
 use futures::io::{AsyncRead, AsyncWrite};
 use libp2p::core::{upgrade, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use std::io;
+use std::marker::PhantomData;
+use tiny_multihash::MultihashDigest;
 
 // Undocumented, but according to JS we our messages have a max size of 512*1024
 // https://github.com/ipfs/js-ipfs-bitswap/blob/d8f80408aadab94c962f6b88f343eb9f39fa0fcc/src/decision-engine/index.js#L16
 const MAX_BUF_SIZE: usize = 524_288;
 
-#[derive(Clone, Debug, Default)]
-pub struct BitswapConfig {}
+#[derive(Clone, Debug)]
+pub struct BitswapConfig<MH> {
+    _marker: PhantomData<MH>,
+}
 
-impl UpgradeInfo for BitswapConfig {
+impl<MH> Default for BitswapConfig<MH> {
+    fn default() -> Self {
+        Self {
+            _marker: Default::default(),
+        }
+    }
+}
+
+impl<MH: MultihashDigest> UpgradeInfo for BitswapConfig<MH> {
     type Info = &'static [u8];
     type InfoIter = iter::Once<Self::Info>;
 
@@ -28,11 +40,12 @@ impl UpgradeInfo for BitswapConfig {
     }
 }
 
-impl<TSocket> InboundUpgrade<TSocket> for BitswapConfig
+impl<MH, TSocket> InboundUpgrade<TSocket> for BitswapConfig<MH>
 where
+    MH: MultihashDigest,
     TSocket: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    type Output = BitswapMessage;
+    type Output = BitswapMessage<MH>;
     type Error = BitswapError;
     #[allow(clippy::type_complexity)]
     type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
@@ -49,7 +62,7 @@ where
     }
 }
 
-impl UpgradeInfo for BitswapMessage {
+impl<MH: MultihashDigest> UpgradeInfo for BitswapMessage<MH> {
     type Info = &'static [u8];
     type InfoIter = iter::Once<Self::Info>;
 
@@ -58,8 +71,9 @@ impl UpgradeInfo for BitswapMessage {
     }
 }
 
-impl<TSocket> OutboundUpgrade<TSocket> for BitswapMessage
+impl<MH, TSocket> OutboundUpgrade<TSocket> for BitswapMessage<MH>
 where
+    MH: MultihashDigest,
     TSocket: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     type Output = ();
@@ -84,6 +98,7 @@ mod tests {
     use async_std::net::{TcpListener, TcpStream};
     use futures::prelude::*;
     use libp2p::core::upgrade;
+    use tiny_multihash::Multihash;
 
     #[async_std::test]
     async fn test_upgrade() {
@@ -92,16 +107,20 @@ mod tests {
 
         let server = async move {
             let incoming = listener.incoming().into_future().await.0.unwrap().unwrap();
-            upgrade::apply_inbound(incoming, BitswapConfig::default())
+            upgrade::apply_inbound(incoming, BitswapConfig::<Multihash>::default())
                 .await
                 .unwrap();
         };
 
         let client = async move {
             let stream = TcpStream::connect(&listener_addr).await.unwrap();
-            upgrade::apply_outbound(stream, BitswapMessage::new(), upgrade::Version::V1)
-                .await
-                .unwrap();
+            upgrade::apply_outbound(
+                stream,
+                BitswapMessage::<Multihash>::new(),
+                upgrade::Version::V1,
+            )
+            .await
+            .unwrap();
         };
 
         future::select(Box::pin(server), Box::pin(client)).await;

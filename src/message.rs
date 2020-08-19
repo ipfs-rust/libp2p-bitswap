@@ -2,9 +2,11 @@ use crate::block::Block;
 use crate::error::BitswapError;
 use crate::prefix::Prefix;
 use core::convert::TryFrom;
-use libipld_core::cid::Cid;
 use prost::Message;
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
+use tiny_cid::Cid;
+use tiny_multihash::MultihashDigest;
 
 mod bitswap_pb {
     include!(concat!(env!("OUT_DIR"), "/bitswap_pb.rs"));
@@ -14,8 +16,9 @@ mod bitswap_pb {
 pub type Priority = i32;
 
 /// A bitswap message.
-#[derive(Clone, Default, Eq, PartialEq)]
-pub struct BitswapMessage {
+#[derive(Clone, Eq, PartialEq)]
+pub struct BitswapMessage<MH> {
+    _marker: PhantomData<MH>,
     /// Wanted blocks.
     want: HashMap<Cid, Priority>,
     /// Blocks to cancel.
@@ -26,7 +29,19 @@ pub struct BitswapMessage {
     blocks: Vec<Block>,
 }
 
-impl core::fmt::Debug for BitswapMessage {
+impl<MH> Default for BitswapMessage<MH> {
+    fn default() -> Self {
+        Self {
+            _marker: Default::default(),
+            want: Default::default(),
+            cancel: Default::default(),
+            full: Default::default(),
+            blocks: Default::default(),
+        }
+    }
+}
+
+impl<MH> core::fmt::Debug for BitswapMessage<MH> {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         for (cid, priority) in self.want() {
             writeln!(fmt, "want: {} {}", cid.to_string(), priority)?;
@@ -41,7 +56,7 @@ impl core::fmt::Debug for BitswapMessage {
     }
 }
 
-impl BitswapMessage {
+impl<MH> BitswapMessage<MH> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -128,14 +143,16 @@ impl BitswapMessage {
             .expect("there is no situation in which the protobuf message can be invalid");
         res
     }
+}
 
+impl<MH: MultihashDigest> BitswapMessage<MH> {
     /// Creates a `Message` from bytes that were received from a substream.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BitswapError> {
         Self::try_from(bytes)
     }
 }
 
-impl TryFrom<&[u8]> for BitswapMessage {
+impl<MH: MultihashDigest> TryFrom<&[u8]> for BitswapMessage<MH> {
     type Error = BitswapError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
@@ -151,7 +168,7 @@ impl TryFrom<&[u8]> for BitswapMessage {
         }
         for payload in proto.payload {
             let prefix = Prefix::new(&payload.prefix)?;
-            let cid = prefix.to_cid(&payload.data)?;
+            let cid = prefix.to_cid::<MH>(&payload.data)?;
             let block = Block {
                 cid,
                 data: payload.data.to_vec().into_boxed_slice(),
@@ -162,7 +179,7 @@ impl TryFrom<&[u8]> for BitswapMessage {
     }
 }
 
-impl From<()> for BitswapMessage {
+impl<MH> From<()> for BitswapMessage<MH> {
     fn from(_: ()) -> Self {
         Self::new()
     }
@@ -172,42 +189,43 @@ impl From<()> for BitswapMessage {
 mod tests {
     use super::*;
     use crate::block::tests::create_block;
+    use tiny_multihash::Multihash;
 
     #[test]
     fn test_empty_message_to_from_bytes() {
-        let message = BitswapMessage::new();
+        let message = BitswapMessage::<Multihash>::new();
         let bytes = message.to_bytes();
-        let new_message = BitswapMessage::from_bytes(&bytes).unwrap();
+        let new_message = BitswapMessage::<Multihash>::from_bytes(&bytes).unwrap();
         assert_eq!(message, new_message);
     }
 
     #[test]
     fn test_want_message_to_from_bytes() {
-        let mut message = BitswapMessage::new();
+        let mut message = BitswapMessage::<Multihash>::new();
         let block = create_block(b"hello world");
         message.want_block(&block.cid(), 1);
         let bytes = message.to_bytes();
-        let new_message = BitswapMessage::from_bytes(&bytes).unwrap();
+        let new_message = BitswapMessage::<Multihash>::from_bytes(&bytes).unwrap();
         assert_eq!(message, new_message);
     }
 
     #[test]
     fn test_cancel_message_to_from_bytes() {
-        let mut message = BitswapMessage::new();
+        let mut message = BitswapMessage::<Multihash>::new();
         let block = create_block(b"hello world");
         message.cancel_block(&block.cid());
         let bytes = message.to_bytes();
-        let new_message = BitswapMessage::from_bytes(&bytes).unwrap();
+        let new_message = BitswapMessage::<Multihash>::from_bytes(&bytes).unwrap();
         assert_eq!(message, new_message);
     }
 
     #[test]
     fn test_payload_message_to_from_bytes() {
-        let mut message = BitswapMessage::new();
+        let mut message = BitswapMessage::<Multihash>::new();
         let block = create_block(b"hello world");
         message.add_block(block);
         let bytes = message.to_bytes();
-        let new_message = BitswapMessage::from_bytes(&bytes).unwrap();
+        let new_message = BitswapMessage::<Multihash>::from_bytes(&bytes).unwrap();
         assert_eq!(message, new_message);
     }
 }
