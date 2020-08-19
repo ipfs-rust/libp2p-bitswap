@@ -9,7 +9,6 @@ use crate::block::Block;
 use crate::ledger::Ledger;
 use crate::message::{BitswapMessage, Priority};
 use crate::protocol::BitswapConfig;
-use cid::Cid;
 use fnv::FnvHashSet;
 use futures::task::Context;
 use futures::task::Poll;
@@ -19,8 +18,9 @@ use libp2p::swarm::protocols_handler::{IntoProtocolsHandler, OneShotHandler, Pro
 use libp2p::swarm::{
     DialPeerCondition, NetworkBehaviour, NetworkBehaviourAction, NotifyHandler, PollParameters,
 };
-use multihash::MultihashDigest;
 use std::collections::{HashMap, VecDeque};
+use tiny_cid::Cid;
+use tiny_multihash::MultihashDigest;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BitswapEvent {
@@ -30,7 +30,7 @@ pub enum BitswapEvent {
 }
 
 /// Network behaviour that handles sending and receiving IPFS blocks.
-pub struct Bitswap<MH = multihash::Multihash> {
+pub struct Bitswap<MH = tiny_multihash::Multihash> {
     /// Queue of events to report to the user.
     events: VecDeque<NetworkBehaviourAction<BitswapMessage<MH>, BitswapEvent>>,
     /// List of peers to send messages to.
@@ -270,9 +270,9 @@ mod tests {
     use libp2p::tcp::TcpConfig;
     use libp2p::yamux::Config as YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
-    use multihash::Multihash;
     use std::io::{Error, ErrorKind};
     use std::time::Duration;
+    use tiny_multihash::Multihash;
 
     fn mk_transport() -> (PeerId, Boxed<(PeerId, StreamMuxerBox), Error>) {
         let key = Keypair::generate_ed25519();

@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 
-use cid::{self, Cid, Version};
-use multihash::MultihashDigest;
+use tiny_cid::{self, Cid, Version};
+use tiny_multihash::MultihashDigest;
 use unsigned_varint::{decode as varint_decode, encode as varint_encode};
 
 /// Prefix represents all metadata of a CID, without the actual content.
@@ -19,7 +19,7 @@ pub struct Prefix {
 
 impl Prefix {
     /// Create a new prefix from encoded bytes.
-    pub fn new(data: &[u8]) -> Result<Prefix, cid::Error> {
+    pub fn new(data: &[u8]) -> Result<Prefix, tiny_cid::Error> {
         let (raw_version, remain) = varint_decode::u64(data)?;
         let version = Version::try_from(raw_version)?;
         let (codec, remain) = varint_decode::u64(remain)?;
@@ -55,7 +55,7 @@ impl Prefix {
     }
 
     /// Create a CID out of the prefix and some data that will be hashed
-    pub fn to_cid<M: MultihashDigest>(&self, data: &[u8]) -> Result<Cid, cid::Error> {
+    pub fn to_cid<M: MultihashDigest>(&self, data: &[u8]) -> Result<Cid, tiny_cid::Error> {
         let mh = M::new(self.mh_type, data)?.to_raw()?;
         Cid::new(self.version, self.codec, mh)
     }

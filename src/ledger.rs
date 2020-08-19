@@ -1,12 +1,12 @@
 use crate::block::Block;
 use crate::message::{BitswapMessage, Priority};
-use cid::Cid;
-use multihash::MultihashDigest;
 use std::collections::HashMap;
+use tiny_cid::Cid;
+use tiny_multihash::MultihashDigest;
 
 /// The Ledger contains the history of transactions with a peer.
 #[derive(Debug)]
-pub struct Ledger<MH = multihash::Multihash> {
+pub struct Ledger<MH> {
     /// The list of wanted blocks sent to the peer.
     sent_want_list: HashMap<Cid, Priority>,
     /// The list of wanted blocks received from the peer.
@@ -81,7 +81,7 @@ impl<MH: MultihashDigest> Ledger<MH> {
 mod tests {
     use super::*;
     use crate::block::tests::create_block;
-    use multihash::Multihash;
+    use tiny_multihash::Multihash;
 
     #[test]
     fn test_ledger_send_block() {

@@ -7,5 +7,5 @@ pub enum BitswapError {
     #[error("Error while decoding bitswap message: {0}")]
     ProtobufError(#[from] prost::DecodeError),
     #[error("Error while parsing cid: {0}")]
-    Cid(#[from] cid::Error),
+    Cid(#[from] tiny_cid::Error),
 }

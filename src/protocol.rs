@@ -10,16 +10,16 @@ use core::iter;
 use core::pin::Pin;
 use futures::io::{AsyncRead, AsyncWrite};
 use libp2p::core::{upgrade, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
-use multihash::MultihashDigest;
 use std::io;
 use std::marker::PhantomData;
+use tiny_multihash::MultihashDigest;
 
 // Undocumented, but according to JS we our messages have a max size of 512*1024
 // https://github.com/ipfs/js-ipfs-bitswap/blob/d8f80408aadab94c962f6b88f343eb9f39fa0fcc/src/decision-engine/index.js#L16
 const MAX_BUF_SIZE: usize = 524_288;
 
 #[derive(Clone, Debug)]
-pub struct BitswapConfig<MH = multihash::Multihash> {
+pub struct BitswapConfig<MH> {
     _marker: PhantomData<MH>,
 }
 
@@ -98,7 +98,7 @@ mod tests {
     use async_std::net::{TcpListener, TcpStream};
     use futures::prelude::*;
     use libp2p::core::upgrade;
-    use multihash::Multihash;
+    use tiny_multihash::Multihash;
 
     #[async_std::test]
     async fn test_upgrade() {

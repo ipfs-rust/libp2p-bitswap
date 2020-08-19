@@ -1,4 +1,4 @@
-use cid::Cid;
+use tiny_cid::Cid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Block {
@@ -23,8 +23,8 @@ impl Block {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use cid::RAW;
-    use multihash::{Multihash, MultihashDigest, SHA2_256};
+    use tiny_cid::RAW;
+    use tiny_multihash::{Multihash, MultihashDigest, SHA2_256};
 
     pub fn create_block(bytes: &[u8]) -> Block {
         let digest = Multihash::new(SHA2_256, bytes).unwrap().to_raw().unwrap();

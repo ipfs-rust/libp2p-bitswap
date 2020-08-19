@@ -1,12 +1,12 @@
 use crate::block::Block;
 use crate::error::BitswapError;
 use crate::prefix::Prefix;
-use cid::Cid;
 use core::convert::TryFrom;
-use multihash::MultihashDigest;
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+use tiny_cid::Cid;
+use tiny_multihash::MultihashDigest;
 
 mod bitswap_pb {
     include!(concat!(env!("OUT_DIR"), "/bitswap_pb.rs"));
@@ -17,7 +17,7 @@ pub type Priority = i32;
 
 /// A bitswap message.
 #[derive(Clone, Eq, PartialEq)]
-pub struct BitswapMessage<MH = multihash::Multihash> {
+pub struct BitswapMessage<MH> {
     _marker: PhantomData<MH>,
     /// Wanted blocks.
     want: HashMap<Cid, Priority>,
@@ -189,7 +189,7 @@ impl<MH> From<()> for BitswapMessage<MH> {
 mod tests {
     use super::*;
     use crate::block::tests::create_block;
-    use multihash::Multihash;
+    use tiny_multihash::Multihash;
 
     #[test]
     fn test_empty_message_to_from_bytes() {
