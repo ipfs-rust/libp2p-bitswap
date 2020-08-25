@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "libp2p-bitswap"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-std",
  "env_logger",
@@ -2573,9 +2573,9 @@ dependencies = [
 
 [[package]]
 name = "tiny-cid"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31818c2b5d7a20fa9e05bdf1a414c24e969ce5f338cce3bed266f23d108ec40"
+checksum = "723e2743581983ed9b7e5bda9a90908a892eb9e90504d04c996c850c81a375b2"
 dependencies = [
  "multibase",
  "tiny-multihash",
@@ -2593,9 +2593,9 @@ dependencies = [
 
 [[package]]
 name = "tiny-multihash"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6bfece37e24447c212bccb8583243e5010d3ddf65ab697281adf1536f759c12"
+checksum = "3eee5dddb519f1c08904f2bfb00a906f999ad8c21b4b63e52cf0b0b7df2f22cc"
 dependencies = [
  "blake2b_simd",
  "blake2s_simd",
