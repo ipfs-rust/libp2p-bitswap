@@ -265,8 +265,8 @@ mod tests {
     use libp2p::core::muxing::StreamMuxerBox;
     use libp2p::core::transport::boxed::Boxed;
     use libp2p::core::transport::upgrade::Version;
-    use libp2p::identity::Keypair;
-    use libp2p::secio::SecioConfig;
+    use libp2p::identity;
+    use libp2p::noise::{Keypair, NoiseConfig, X25519Spec};
     use libp2p::tcp::TcpConfig;
     use libp2p::yamux::Config as YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
@@ -275,12 +275,17 @@ mod tests {
     use tiny_multihash::Multihash;
 
     fn mk_transport() -> (PeerId, Boxed<(PeerId, StreamMuxerBox), Error>) {
-        let key = Keypair::generate_ed25519();
-        let peer_id = key.public().into_peer_id();
+        let id_key = identity::Keypair::generate_ed25519();
+        let peer_id = id_key.public().into_peer_id();
+        let dh_key = Keypair::<X25519Spec>::new()
+            .into_authentic(&id_key)
+            .unwrap();
+        let noise = NoiseConfig::xx(dh_key).into_authenticated();
+
         let transport = TcpConfig::new()
             .nodelay(true)
             .upgrade(Version::V1)
-            .authenticate(SecioConfig::new(key))
+            .authenticate(noise)
             .multiplex(YamuxConfig::default())
             .timeout(Duration::from_secs(20))
             .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
