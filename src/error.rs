@@ -8,4 +8,8 @@ pub enum BitswapError {
     ProtobufError(#[from] prost::DecodeError),
     #[error("Error while parsing cid: {0}")]
     Cid(#[from] tiny_cid::Error),
+    #[error("Invalid message")]
+    InvalidMessage,
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }

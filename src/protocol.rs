@@ -1,100 +1,103 @@
+/// Bitswap wire protocol.
 use crate::error::BitswapError;
-/// Reperesents a prototype for an upgrade to handle the bitswap protocol.
-///
-/// The protocol works the following way:
-///
-/// - TODO
 use crate::message::BitswapMessage;
-use core::future::Future;
 use core::iter;
-use core::pin::Pin;
 use futures::io::{AsyncRead, AsyncWrite};
-use libp2p::core::{upgrade, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
+use futures::sink::SinkExt;
+use futures::stream::TryStreamExt;
+use futures::{future, sink, stream};
+use futures_codec::{BytesMut, Framed};
+use libp2p::core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use std::io;
 use std::marker::PhantomData;
 use tiny_multihash::MultihashDigest;
+use unsigned_varint::codec::UviBytes;
 
-// Undocumented, but according to JS we our messages have a max size of 512*1024
-// https://github.com/ipfs/js-ipfs-bitswap/blob/d8f80408aadab94c962f6b88f343eb9f39fa0fcc/src/decision-engine/index.js#L16
-const MAX_BUF_SIZE: usize = 524_288;
-
-#[derive(Clone, Debug)]
-pub struct BitswapConfig<MH> {
-    _marker: PhantomData<MH>,
+#[derive(Clone, Copy, Debug)]
+pub struct BitswapProtocolConfig<MH> {
+    pub _marker: PhantomData<MH>,
+    /// Maximum allowed size of a packet.
+    pub max_packet_size: usize,
 }
 
-impl<MH> Default for BitswapConfig<MH> {
-    fn default() -> Self {
-        Self {
-            _marker: Default::default(),
-        }
-    }
-}
-
-impl<MH: MultihashDigest> UpgradeInfo for BitswapConfig<MH> {
+impl<MH> UpgradeInfo for BitswapProtocolConfig<MH> {
     type Info = &'static [u8];
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(b"/ipfs/bitswap/1.1.0")
+        iter::once(b"/ipfs/bitswap/2.0.0")
     }
 }
 
-impl<MH, TSocket> InboundUpgrade<TSocket> for BitswapConfig<MH>
+impl<MH, C> InboundUpgrade<C> for BitswapProtocolConfig<MH>
 where
     MH: MultihashDigest,
-    TSocket: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    C: AsyncRead + AsyncWrite + Unpin,
 {
-    type Output = BitswapMessage<MH>;
+    type Output = BitswapStreamSink<C>;
     type Error = BitswapError;
-    #[allow(clippy::type_complexity)]
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
+    type Future = future::Ready<Result<Self::Output, Self::Error>>;
 
-    #[inline]
-    fn upgrade_inbound(self, mut socket: TSocket, info: Self::Info) -> Self::Future {
-        Box::pin(async move {
-            log::debug!("upgrade_inbound: {}", std::str::from_utf8(info).unwrap());
-            let packet = upgrade::read_one(&mut socket, MAX_BUF_SIZE).await?;
-            let message = BitswapMessage::from_bytes(&packet)?;
-            log::debug!("inbound message: {:?}", message);
-            Ok(message)
-        })
+    fn upgrade_inbound(self, incoming: C, _: Self::Info) -> Self::Future {
+        let mut codec = UviBytes::default();
+        codec.set_max_len(self.max_packet_size);
+
+        future::ok(
+            Framed::new(incoming, codec)
+                .err_into()
+                .with::<_, _, fn(_) -> _, _>(|message: BitswapMessage| {
+                    future::ready(Ok(io::Cursor::new(message.into_bytes())))
+                })
+                .and_then::<_, fn(_) -> _>(|bytes| {
+                    future::ready(BitswapMessage::from_bytes::<MH>(&bytes))
+                }),
+        )
     }
 }
 
-impl<MH: MultihashDigest> UpgradeInfo for BitswapMessage<MH> {
-    type Info = &'static [u8];
-    type InfoIter = iter::Once<Self::Info>;
-
-    fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(b"/ipfs/bitswap/1.1.0")
-    }
-}
-
-impl<MH, TSocket> OutboundUpgrade<TSocket> for BitswapMessage<MH>
+impl<MH, C> OutboundUpgrade<C> for BitswapProtocolConfig<MH>
 where
     MH: MultihashDigest,
-    TSocket: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    C: AsyncRead + AsyncWrite + Unpin,
 {
-    type Output = ();
-    type Error = io::Error;
-    #[allow(clippy::type_complexity)]
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
+    type Output = BitswapStreamSink<C>;
+    type Error = BitswapError;
+    type Future = future::Ready<Result<Self::Output, Self::Error>>;
 
     #[inline]
-    fn upgrade_outbound(self, mut socket: TSocket, info: Self::Info) -> Self::Future {
-        Box::pin(async move {
-            log::debug!("upgrade_outbound: {}", std::str::from_utf8(info).unwrap());
-            let bytes = self.to_bytes();
-            upgrade::write_one(&mut socket, bytes).await?;
-            Ok(())
-        })
+    fn upgrade_outbound(self, outgoing: C, _: Self::Info) -> Self::Future {
+        let mut codec = UviBytes::default();
+        codec.set_max_len(self.max_packet_size);
+
+        future::ok(
+            Framed::new(outgoing, codec)
+                .err_into()
+                .with::<_, _, fn(_) -> _, _>(|message: BitswapMessage| {
+                    future::ready(Ok(io::Cursor::new(message.into_bytes())))
+                })
+                .and_then::<_, fn(_) -> _>(|bytes| {
+                    future::ready(BitswapMessage::from_bytes::<MH>(&bytes))
+                }),
+        )
     }
 }
+
+pub type BitswapStreamSink<C> = stream::AndThen<
+    sink::With<
+        stream::ErrInto<Framed<C, UviBytes<io::Cursor<Vec<u8>>>>, BitswapError>,
+        io::Cursor<Vec<u8>>,
+        BitswapMessage,
+        future::Ready<Result<io::Cursor<Vec<u8>>, BitswapError>>,
+        fn(BitswapMessage) -> future::Ready<Result<io::Cursor<Vec<u8>>, BitswapError>>,
+    >,
+    future::Ready<Result<BitswapMessage, BitswapError>>,
+    fn(BytesMut) -> future::Ready<Result<BitswapMessage, BitswapError>>,
+>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::tests::create_cid;
     use async_std::net::{TcpListener, TcpStream};
     use futures::prelude::*;
     use libp2p::core::upgrade;
@@ -102,25 +105,70 @@ mod tests {
 
     #[async_std::test]
     async fn test_upgrade() {
+        env_logger::try_init().ok();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listener_addr = listener.local_addr().unwrap();
 
+        let protocol_config = BitswapProtocolConfig {
+            _marker: PhantomData::<Multihash>,
+            max_packet_size: crate::DEFAULT_MAX_PACKET_SIZE,
+        };
+        let data = vec![42u8; crate::DEFAULT_MAX_PACKET_SIZE - 14];
+        let cid = create_cid(&data);
+        let message = BitswapMessage::BlockResponse(cid, data);
+        let message2 = message.clone();
+
         let server = async move {
             let incoming = listener.incoming().into_future().await.0.unwrap().unwrap();
-            upgrade::apply_inbound(incoming, BitswapConfig::<Multihash>::default())
+            let mut channel = upgrade::apply_inbound(incoming, protocol_config)
                 .await
                 .unwrap();
+            let message = channel.next().await.unwrap().unwrap();
+            assert_eq!(message, message2);
         };
 
         let client = async move {
             let stream = TcpStream::connect(&listener_addr).await.unwrap();
-            upgrade::apply_outbound(
-                stream,
-                BitswapMessage::<Multihash>::new(),
-                upgrade::Version::V1,
-            )
-            .await
-            .unwrap();
+            let mut channel =
+                upgrade::apply_outbound(stream, protocol_config, upgrade::Version::V1)
+                    .await
+                    .unwrap();
+            channel.send(message).await.unwrap();
+        };
+
+        future::select(Box::pin(server), Box::pin(client)).await;
+    }
+
+    #[async_std::test]
+    #[should_panic]
+    async fn test_max_message_size() {
+        env_logger::try_init().ok();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+
+        let protocol_config = BitswapProtocolConfig {
+            _marker: PhantomData::<Multihash>,
+            max_packet_size: crate::DEFAULT_MAX_PACKET_SIZE,
+        };
+        let data = vec![42u8; crate::DEFAULT_MAX_PACKET_SIZE - 13];
+        let cid = create_cid(&data);
+        let message = BitswapMessage::BlockResponse(cid, data);
+
+        let server = async move {
+            let incoming = listener.incoming().into_future().await.0.unwrap().unwrap();
+            let mut channel = upgrade::apply_inbound(incoming, protocol_config)
+                .await
+                .unwrap();
+            channel.next().await.unwrap().unwrap();
+        };
+
+        let client = async move {
+            let stream = TcpStream::connect(&listener_addr).await.unwrap();
+            let mut channel =
+                upgrade::apply_outbound(stream, protocol_config, upgrade::Version::V1)
+                    .await
+                    .unwrap();
+            channel.send(message).await.unwrap();
         };
 
         future::select(Box::pin(server), Box::pin(client)).await;

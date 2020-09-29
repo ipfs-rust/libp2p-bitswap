@@ -1,10 +1,7 @@
-use crate::block::Block;
 use crate::error::BitswapError;
 use crate::prefix::Prefix;
 use core::convert::TryFrom;
 use prost::Message;
-use std::collections::{HashMap, HashSet};
-use std::marker::PhantomData;
 use tiny_cid::Cid;
 use tiny_multihash::MultihashDigest;
 
@@ -12,220 +9,120 @@ mod bitswap_pb {
     include!(concat!(env!("OUT_DIR"), "/bitswap_pb.rs"));
 }
 
-/// Priority of a wanted block.
-pub type Priority = i32;
-
 /// A bitswap message.
-#[derive(Clone, Eq, PartialEq)]
-pub struct BitswapMessage<MH> {
-    _marker: PhantomData<MH>,
-    /// Wanted blocks.
-    want: HashMap<Cid, Priority>,
-    /// Blocks to cancel.
-    cancel: HashSet<Cid>,
-    /// Wheather it is the full list of wanted blocks.
-    full: bool,
-    /// List of blocks to send.
-    blocks: Vec<Block>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BitswapMessage {
+    HaveRequest(Cid),
+    BlockRequest(Cid),
+    HaveResponse(Cid, bool),
+    BlockResponse(Cid, Vec<u8>),
 }
 
-impl<MH> Default for BitswapMessage<MH> {
-    fn default() -> Self {
-        Self {
-            _marker: Default::default(),
-            want: Default::default(),
-            cancel: Default::default(),
-            full: Default::default(),
-            blocks: Default::default(),
-        }
-    }
-}
-
-impl<MH> core::fmt::Debug for BitswapMessage<MH> {
-    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        for (cid, priority) in self.want() {
-            writeln!(fmt, "want: {} {}", cid.to_string(), priority)?;
-        }
-        for cid in self.cancel() {
-            writeln!(fmt, "cancel: {}", cid.to_string())?;
-        }
-        for block in self.blocks() {
-            writeln!(fmt, "block: {}", block.cid().to_string())?;
-        }
-        Ok(())
-    }
-}
-
-impl<MH> BitswapMessage<MH> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Is message empty.
-    pub fn is_empty(&self) -> bool {
-        self.want.is_empty() && self.cancel.is_empty() && self.blocks.is_empty()
-    }
-
-    /// Returns the list of blocks.
-    pub fn blocks(&self) -> &[Block] {
-        &self.blocks
-    }
-
-    /// Pops a block from the message.
-    pub fn pop_block(&mut self) -> Option<Block> {
-        self.blocks.pop()
-    }
-
-    /// Returns the list of wanted blocks.
-    pub fn want(&self) -> impl Iterator<Item = (&Cid, Priority)> {
-        self.want.iter().map(|(cid, priority)| (cid, *priority))
-    }
-
-    /// Returns the list of cancelled blocks.
-    pub fn cancel(&self) -> impl Iterator<Item = &Cid> {
-        self.cancel.iter()
-    }
-
-    /// Adds a `Block` to the message.
-    pub fn add_block(&mut self, block: Block) {
-        self.blocks.push(block);
-    }
-
-    /// Removes the block from the message.
-    pub fn remove_block(&mut self, cid: &Cid) {
-        self.blocks.retain(|block| block.cid() != cid);
-    }
-
-    /// Adds a block to the want list.
-    pub fn want_block(&mut self, cid: &Cid, priority: Priority) {
-        self.cancel.remove(cid);
-        self.want.insert(cid.clone(), priority);
-    }
-
-    /// Adds a block to the cancel list.
-    pub fn cancel_block(&mut self, cid: &Cid) {
-        if self.want.contains_key(cid) {
-            self.want.remove(cid);
-        } else {
-            self.cancel.insert(cid.clone());
-        }
-    }
-
-    /// Turns this `Message` into a message that can be sent to a substream.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut proto = bitswap_pb::Message::default();
-        let mut wantlist = bitswap_pb::message::Wantlist::default();
-        for (cid, priority) in self.want() {
-            let mut entry = bitswap_pb::message::wantlist::Entry::default();
-            entry.block = cid.to_bytes();
-            entry.priority = priority;
-            wantlist.entries.push(entry);
-        }
-        for cid in self.cancel() {
-            let mut entry = bitswap_pb::message::wantlist::Entry::default();
-            entry.block = cid.to_bytes();
-            entry.cancel = true;
-            wantlist.entries.push(entry);
-        }
-        for block in self.blocks() {
-            let mut payload = bitswap_pb::message::Block::default();
-            let prefix: Prefix = block.cid().into();
-            payload.prefix = prefix.to_bytes();
-            payload.data = block.data().to_vec();
-            proto.payload.push(payload);
-        }
-        if !wantlist.entries.is_empty() {
-            proto.wantlist = Some(wantlist);
-        }
-        let mut res = Vec::with_capacity(proto.encoded_len());
-        proto
-            .encode(&mut res)
-            .expect("there is no situation in which the protobuf message can be invalid");
-        res
-    }
-}
-
-impl<MH: MultihashDigest> BitswapMessage<MH> {
-    /// Creates a `Message` from bytes that were received from a substream.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, BitswapError> {
-        Self::try_from(bytes)
-    }
-}
-
-impl<MH: MultihashDigest> TryFrom<&[u8]> for BitswapMessage<MH> {
-    type Error = BitswapError;
-
-    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        let proto: bitswap_pb::Message = bitswap_pb::Message::decode(bytes)?;
-        let mut message = Self::new();
-        for entry in proto.wantlist.unwrap_or_default().entries {
-            let cid = Cid::try_from(entry.block)?;
-            if entry.cancel {
-                message.cancel_block(&cid);
-            } else {
-                message.want_block(&cid, entry.priority);
+impl BitswapMessage {
+    pub fn encode(self) -> bitswap_pb::Message {
+        let mut msg = bitswap_pb::Message::default();
+        match self {
+            Self::HaveRequest(cid) => {
+                let mut entry = bitswap_pb::message::wantlist::Entry::default();
+                entry.block = cid.to_bytes();
+                entry.want_type = 1;
+                let mut wantlist = bitswap_pb::message::Wantlist::default();
+                wantlist.entries.push(entry);
+                msg.wantlist = Some(wantlist);
             }
-        }
-        for payload in proto.payload {
-            let prefix = Prefix::new(&payload.prefix)?;
-            let cid = prefix.to_cid::<MH>(&payload.data)?;
-            let block = Block {
-                cid,
-                data: payload.data.to_vec().into_boxed_slice(),
-            };
-            message.add_block(block);
-        }
-        Ok(message)
+            Self::BlockRequest(cid) => {
+                let mut entry = bitswap_pb::message::wantlist::Entry::default();
+                entry.block = cid.to_bytes();
+                let mut wantlist = bitswap_pb::message::Wantlist::default();
+                wantlist.entries.push(entry);
+                msg.wantlist = Some(wantlist);
+            }
+            Self::HaveResponse(cid, have) => {
+                let mut presence = bitswap_pb::message::BlockPresence::default();
+                presence.cid = cid.to_bytes();
+                presence.r#type = if have { 0 } else { 1 };
+                msg.block_presences.push(presence);
+            }
+            Self::BlockResponse(cid, data) => {
+                let mut block = bitswap_pb::message::Block::default();
+                block.prefix = Prefix::from(&cid).to_bytes();
+                block.data = data;
+                msg.payload.push(block);
+            }
+        };
+        msg
     }
-}
 
-impl<MH> From<()> for BitswapMessage<MH> {
-    fn from(_: ()) -> Self {
-        Self::new()
+    pub fn into_bytes(self) -> Vec<u8> {
+        let msg = self.encode();
+        let mut buf = Vec::with_capacity(msg.encoded_len());
+        msg.encode(&mut buf)
+            .expect("Vec<u8> provides capacity as needed");
+        buf
+    }
+
+    pub fn decode<M: MultihashDigest>(mut msg: bitswap_pb::Message) -> Result<Self, BitswapError> {
+        let mut wantlist = msg.wantlist.unwrap_or_default();
+        if wantlist.entries.len() + msg.payload.len() + msg.block_presences.len() != 1 {
+            return Err(BitswapError::InvalidMessage);
+        }
+        if let Some(entry) = wantlist.entries.pop() {
+            let cid = Cid::try_from(entry.block)?;
+            let req = match entry.want_type {
+                0 => Self::BlockRequest(cid),
+                1 => Self::HaveRequest(cid),
+                _ => return Err(BitswapError::InvalidMessage),
+            };
+            return Ok(req);
+        }
+        if let Some(block) = msg.payload.pop() {
+            let cid = Prefix::new(&block.prefix)?.to_cid::<M>(&block.data)?;
+            let data = block.data;
+            return Ok(Self::BlockResponse(cid, data));
+        }
+        if let Some(presence) = msg.block_presences.pop() {
+            let cid = Cid::try_from(presence.cid)?;
+            let have = presence.r#type == 0;
+            return Ok(Self::HaveResponse(cid, have));
+        }
+        unreachable!();
+    }
+
+    pub fn from_bytes<M: MultihashDigest>(bytes: &[u8]) -> Result<Self, BitswapError> {
+        let pb = bitswap_pb::Message::decode(bytes)?;
+        Self::decode::<M>(pb)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::block::tests::create_block;
     use tiny_multihash::Multihash;
 
-    #[test]
-    fn test_empty_message_to_from_bytes() {
-        let message = BitswapMessage::<Multihash>::new();
-        let bytes = message.to_bytes();
-        let new_message = BitswapMessage::<Multihash>::from_bytes(&bytes).unwrap();
-        assert_eq!(message, new_message);
+    pub fn create_cid(bytes: &[u8]) -> Cid {
+        use tiny_cid::RAW;
+        use tiny_multihash::SHA2_256;
+        let digest = Multihash::new(SHA2_256, bytes).unwrap().to_raw().unwrap();
+        Cid::new_v1(RAW, digest)
     }
 
     #[test]
-    fn test_want_message_to_from_bytes() {
-        let mut message = BitswapMessage::<Multihash>::new();
-        let block = create_block(b"hello world");
-        message.want_block(&block.cid(), 1);
-        let bytes = message.to_bytes();
-        let new_message = BitswapMessage::<Multihash>::from_bytes(&bytes).unwrap();
-        assert_eq!(message, new_message);
-    }
-
-    #[test]
-    fn test_cancel_message_to_from_bytes() {
-        let mut message = BitswapMessage::<Multihash>::new();
-        let block = create_block(b"hello world");
-        message.cancel_block(&block.cid());
-        let bytes = message.to_bytes();
-        let new_message = BitswapMessage::<Multihash>::from_bytes(&bytes).unwrap();
-        assert_eq!(message, new_message);
-    }
-
-    #[test]
-    fn test_payload_message_to_from_bytes() {
-        let mut message = BitswapMessage::<Multihash>::new();
-        let block = create_block(b"hello world");
-        message.add_block(block);
-        let bytes = message.to_bytes();
-        let new_message = BitswapMessage::<Multihash>::from_bytes(&bytes).unwrap();
-        assert_eq!(message, new_message);
+    fn test_message_encode_decode() {
+        let messages = [
+            BitswapMessage::HaveRequest(create_cid(&b"have_request"[..])),
+            BitswapMessage::BlockRequest(create_cid(&b"block_request"[..])),
+            BitswapMessage::HaveResponse(create_cid(&b"have_response"[..]), true),
+            BitswapMessage::HaveResponse(create_cid(&b"have_response"[..]), false),
+            BitswapMessage::BlockResponse(
+                create_cid(&b"block_response"[..]),
+                b"block_response".to_vec(),
+            ),
+        ];
+        for message in &messages {
+            assert_eq!(
+                &BitswapMessage::decode::<Multihash>(message.clone().encode()).unwrap(),
+                message
+            );
+        }
     }
 }
