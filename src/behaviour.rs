@@ -89,14 +89,6 @@ impl<MH: MultihashDigest> Bitswap<MH> {
         }
     }
 
-    pub fn want_block(&mut self, cid: Cid) {
-        self.wanted_blocks.insert(cid);
-    }
-
-    pub fn cancel_block(&mut self, cid: &Cid) {
-        self.wanted_blocks.remove(cid);
-    }
-
     pub fn have_block(&mut self, cid: &Cid) -> Result<(), CuckooError> {
         self.have_blocks.test_and_add(&cid)?;
         Ok(())
@@ -106,7 +98,7 @@ impl<MH: MultihashDigest> Bitswap<MH> {
         self.have_blocks.delete(cid);
     }
 
-    pub fn request_have(&mut self, peer_id: PeerId, cid: Cid) {
+    pub fn has_block(&mut self, peer_id: PeerId, cid: Cid) {
         self.events
             .push_back(NetworkBehaviourAction::NotifyHandler {
                 peer_id,
@@ -115,7 +107,8 @@ impl<MH: MultihashDigest> Bitswap<MH> {
             });
     }
 
-    pub fn request_block(&mut self, peer_id: PeerId, cid: Cid) {
+    pub fn want_block(&mut self, peer_id: PeerId, cid: Cid) {
+        self.wanted_blocks.insert(cid);
         self.events
             .push_back(NetworkBehaviourAction::NotifyHandler {
                 peer_id,
@@ -124,16 +117,11 @@ impl<MH: MultihashDigest> Bitswap<MH> {
             });
     }
 
-    fn respond_have(&mut self, peer_id: PeerId, cid: Cid, have: bool) {
-        self.events
-            .push_back(NetworkBehaviourAction::NotifyHandler {
-                peer_id,
-                handler: NotifyHandler::Any,
-                event: BitswapMessage::HaveResponse(cid, have),
-            });
+    pub fn cancel_block(&mut self, cid: &Cid) {
+        self.wanted_blocks.remove(cid);
     }
 
-    pub fn respond_block(&mut self, peer_id: PeerId, cid: Cid, data: Vec<u8>) {
+    pub fn send_block(&mut self, peer_id: PeerId, cid: Cid, data: Vec<u8>) {
         if !self.connected_peers.contains(&peer_id) {
             return;
         }
@@ -181,7 +169,12 @@ impl<MH: MultihashDigest> NetworkBehaviour for Bitswap<MH> {
         match message {
             BitswapMessage::HaveRequest(cid) => {
                 let have = self.have_blocks.contains(&cid);
-                self.respond_have(peer_id, cid, have);
+                self.events
+                    .push_back(NetworkBehaviourAction::NotifyHandler {
+                        peer_id,
+                        handler: NotifyHandler::Any,
+                        event: BitswapMessage::HaveResponse(cid, have),
+                    });
             }
             BitswapMessage::HaveResponse(cid, have) => {
                 let ev = BitswapEvent::Have { peer_id, cid, have };
@@ -200,6 +193,13 @@ impl<MH: MultihashDigest> NetworkBehaviour for Bitswap<MH> {
                     let ev = BitswapEvent::Want { peer_id, cid };
                     self.events
                         .push_back(NetworkBehaviourAction::GenerateEvent(ev));
+                } else {
+                    self.events
+                        .push_back(NetworkBehaviourAction::NotifyHandler {
+                            peer_id,
+                            handler: NotifyHandler::Any,
+                            event: BitswapMessage::HaveResponse(cid, false),
+                        });
                 }
             }
         }
@@ -285,7 +285,7 @@ mod tests {
                 match swarm1.next_event().await {
                     SwarmEvent::Behaviour(BitswapEvent::Want { peer_id, cid }) => {
                         if cid == orig_cid {
-                            swarm1.respond_block(peer_id, cid, orig_data.clone());
+                            swarm1.send_block(peer_id, cid, orig_data.clone());
                         }
                     }
                     e => {
@@ -297,14 +297,13 @@ mod tests {
 
         let peer2 = async move {
             Swarm::dial_addr(&mut swarm2, rx.next().await.unwrap()).unwrap();
-            swarm2.want_block(orig_cid);
             log::debug!("polling swarm2");
 
             loop {
                 match swarm2.next_event().await {
                     SwarmEvent::Behaviour(BitswapEvent::Have { peer_id, cid, have }) => {
                         if cid == orig_cid && have {
-                            swarm2.request_block(peer_id, cid);
+                            swarm2.want_block(peer_id, cid);
                         }
                     }
                     SwarmEvent::Behaviour(BitswapEvent::Block {
@@ -317,7 +316,7 @@ mod tests {
                         }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        swarm2.request_have(peer_id, orig_cid);
+                        swarm2.has_block(peer_id, orig_cid);
                     }
                     e => {
                         log::debug!("swarm2 {:?}", e);
