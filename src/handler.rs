@@ -11,7 +11,7 @@ use libp2p::swarm::{NegotiatedSubstream, SubstreamProtocol};
 use std::collections::VecDeque;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tiny_multihash::MultihashDigest;
+use tiny_multihash::{MultihashCode, U64};
 
 #[derive(Clone, Debug)]
 pub struct BitswapHandlerConfig<MH> {
@@ -53,7 +53,7 @@ impl<MH> BitswapHandler<MH> {
     }
 }
 
-impl<MH: MultihashDigest> ProtocolsHandler for BitswapHandler<MH> {
+impl<MH: MultihashCode<AllocSize = U64>> ProtocolsHandler for BitswapHandler<MH> {
     type InEvent = BitswapMessage;
     type OutEvent = BitswapMessage;
     type Error = ProtocolsHandlerUpgrErr<BitswapError>;
@@ -63,7 +63,7 @@ impl<MH: MultihashDigest> ProtocolsHandler for BitswapHandler<MH> {
     type InboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        SubstreamProtocol::new(self.config.protocol_config.clone(), ())
+        SubstreamProtocol::new(self.config.protocol_config, ())
             .with_timeout(self.config.idle_timeout)
     }
 
@@ -132,7 +132,7 @@ impl<MH: MultihashDigest> ProtocolsHandler for BitswapHandler<MH> {
         if !self.open_outbound && self.outbound_stream.is_none() {
             self.open_outbound = true;
             return Poll::Ready(ProtocolsHandlerEvent::OutboundSubstreamRequest {
-                protocol: SubstreamProtocol::new(self.config.protocol_config.clone(), ())
+                protocol: SubstreamProtocol::new(self.config.protocol_config, ())
                     .with_timeout(self.config.idle_timeout),
             });
         }

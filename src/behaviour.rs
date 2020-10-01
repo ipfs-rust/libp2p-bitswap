@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::time::Duration;
 use tiny_cid::Cid;
-use tiny_multihash::MultihashDigest;
+use tiny_multihash::{MultihashCode, U64};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BitswapEvent {
@@ -56,7 +56,7 @@ impl Default for BitswapConfig {
 }
 
 /// Network behaviour that handles sending and receiving IPFS blocks.
-pub struct Bitswap<MH = tiny_multihash::Multihash> {
+pub struct Bitswap<MH> {
     _marker: PhantomData<MH>,
     /// Bitswap config.
     config: BitswapConfig,
@@ -70,13 +70,13 @@ pub struct Bitswap<MH = tiny_multihash::Multihash> {
     have_blocks: CuckooFilter<FnvHasher>,
 }
 
-impl<MH: MultihashDigest> Default for Bitswap<MH> {
+impl Default for Bitswap<tiny_multihash::Code> {
     fn default() -> Self {
         Self::new(BitswapConfig::default())
     }
 }
 
-impl<MH: MultihashDigest> Bitswap<MH> {
+impl<MH: MultihashCode<AllocSize = U64>> Bitswap<MH> {
     /// Creates a new `Bitswap`.
     pub fn new(config: BitswapConfig) -> Self {
         Self {
@@ -87,6 +87,10 @@ impl<MH: MultihashDigest> Bitswap<MH> {
             wanted_blocks: Default::default(),
             have_blocks: CuckooFilter::with_capacity(cuckoofilter::DEFAULT_CAPACITY),
         }
+    }
+
+    pub fn skip_block(&self, cid: &Cid) -> bool {
+        self.have_blocks.contains(cid)
     }
 
     pub fn have_block(&mut self, cid: &Cid) -> Result<(), CuckooError> {
@@ -121,20 +125,33 @@ impl<MH: MultihashDigest> Bitswap<MH> {
         self.wanted_blocks.remove(cid);
     }
 
-    pub fn send_block(&mut self, peer_id: PeerId, cid: Cid, data: Vec<u8>) {
+    pub fn send_block(&mut self, peer_id: PeerId, cid: Cid, data: Option<Vec<u8>>) {
         if !self.connected_peers.contains(&peer_id) {
             return;
         }
+        if let Some(data) = data {
+            self.events
+                .push_back(NetworkBehaviourAction::NotifyHandler {
+                    peer_id,
+                    handler: NotifyHandler::Any,
+                    event: BitswapMessage::BlockResponse(cid, data),
+                });
+        } else {
+            self.send_have(peer_id, cid, false);
+        }
+    }
+
+    fn send_have(&mut self, peer_id: PeerId, cid: Cid, have: bool) {
         self.events
             .push_back(NetworkBehaviourAction::NotifyHandler {
                 peer_id,
                 handler: NotifyHandler::Any,
-                event: BitswapMessage::BlockResponse(cid, data),
+                event: BitswapMessage::HaveResponse(cid, have),
             });
     }
 }
 
-impl<MH: MultihashDigest> NetworkBehaviour for Bitswap<MH> {
+impl<MH: MultihashCode<AllocSize = U64>> NetworkBehaviour for Bitswap<MH> {
     type ProtocolsHandler = BitswapHandler<MH>;
     type OutEvent = BitswapEvent;
 
@@ -169,12 +186,7 @@ impl<MH: MultihashDigest> NetworkBehaviour for Bitswap<MH> {
         match message {
             BitswapMessage::HaveRequest(cid) => {
                 let have = self.have_blocks.contains(&cid);
-                self.events
-                    .push_back(NetworkBehaviourAction::NotifyHandler {
-                        peer_id,
-                        handler: NotifyHandler::Any,
-                        event: BitswapMessage::HaveResponse(cid, have),
-                    });
+                self.send_have(peer_id, cid, have);
             }
             BitswapMessage::HaveResponse(cid, have) => {
                 let ev = BitswapEvent::Have { peer_id, cid, have };
@@ -194,12 +206,7 @@ impl<MH: MultihashDigest> NetworkBehaviour for Bitswap<MH> {
                     self.events
                         .push_back(NetworkBehaviourAction::GenerateEvent(ev));
                 } else {
-                    self.events
-                        .push_back(NetworkBehaviourAction::NotifyHandler {
-                            peer_id,
-                            handler: NotifyHandler::Any,
-                            event: BitswapMessage::HaveResponse(cid, false),
-                        });
+                    self.send_have(peer_id, cid, false);
                 }
             }
         }
@@ -233,7 +240,6 @@ mod tests {
     use libp2p::{PeerId, Swarm, Transport};
     use std::io::{Error, ErrorKind};
     use std::time::Duration;
-    use tiny_multihash::Multihash;
 
     fn mk_transport() -> (PeerId, Boxed<(PeerId, StreamMuxerBox), Error>) {
         let id_key = identity::Keypair::generate_ed25519();
@@ -260,10 +266,10 @@ mod tests {
         env_logger::try_init().ok();
 
         let (peer1_id, trans) = mk_transport();
-        let mut swarm1 = Swarm::new(trans, Bitswap::<Multihash>::default(), peer1_id.clone());
+        let mut swarm1 = Swarm::new(trans, Bitswap::default(), peer1_id.clone());
 
         let (peer2_id, trans) = mk_transport();
-        let mut swarm2 = Swarm::new(trans, Bitswap::<Multihash>::default(), peer2_id.clone());
+        let mut swarm2 = Swarm::new(trans, Bitswap::default(), peer2_id.clone());
 
         let (mut tx, mut rx) = mpsc::channel::<Multiaddr>(1);
         Swarm::listen_on(&mut swarm1, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
@@ -285,7 +291,7 @@ mod tests {
                 match swarm1.next_event().await {
                     SwarmEvent::Behaviour(BitswapEvent::Want { peer_id, cid }) => {
                         if cid == orig_cid {
-                            swarm1.send_block(peer_id, cid, orig_data.clone());
+                            swarm1.send_block(peer_id, cid, Some(orig_data.clone()));
                         }
                     }
                     e => {

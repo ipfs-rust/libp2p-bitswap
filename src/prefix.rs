@@ -1,6 +1,6 @@
 use std::convert::TryFrom;
-use tiny_cid::{self, Cid, Version};
-use tiny_multihash::MultihashDigest;
+use tiny_cid::{Cid, Version};
+use tiny_multihash::{MultihashCode, U64};
 use unsigned_varint::{decode as varint_decode, encode as varint_encode};
 
 /// Prefix represents all metadata of a CID, without the actual content.
@@ -54,8 +54,13 @@ impl Prefix {
     }
 
     /// Create a CID out of the prefix and some data that will be hashed
-    pub fn to_cid<M: MultihashDigest>(&self, data: &[u8]) -> Result<Cid, tiny_cid::Error> {
-        let mh = M::new(self.mh_type, data)?.to_raw()?;
+    pub fn to_cid<M: MultihashCode<AllocSize = U64>>(
+        &self,
+        data: &[u8],
+    ) -> Result<Cid, tiny_cid::Error> {
+        let mh = M::try_from(self.mh_type)
+            .map_err(|_| tiny_cid::Error::ParsingError)?
+            .digest(data);
         Cid::new(self.version, self.codec, mh)
     }
 }

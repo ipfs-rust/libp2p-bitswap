@@ -3,7 +3,7 @@ use crate::prefix::Prefix;
 use core::convert::TryFrom;
 use prost::Message;
 use tiny_cid::Cid;
-use tiny_multihash::MultihashDigest;
+use tiny_multihash::{MultihashCode, U64};
 
 mod bitswap_pb {
     include!(concat!(env!("OUT_DIR"), "/bitswap_pb.rs"));
@@ -61,7 +61,9 @@ impl BitswapMessage {
         buf
     }
 
-    pub fn decode<M: MultihashDigest>(mut msg: bitswap_pb::Message) -> Result<Self, BitswapError> {
+    pub fn decode<M: MultihashCode<AllocSize = U64>>(
+        mut msg: bitswap_pb::Message,
+    ) -> Result<Self, BitswapError> {
         let mut wantlist = msg.wantlist.unwrap_or_default();
         if wantlist.entries.len() + msg.payload.len() + msg.block_presences.len() != 1 {
             return Err(BitswapError::InvalidMessage);
@@ -88,7 +90,9 @@ impl BitswapMessage {
         unreachable!();
     }
 
-    pub fn from_bytes<M: MultihashDigest>(bytes: &[u8]) -> Result<Self, BitswapError> {
+    pub fn from_bytes<M: MultihashCode<AllocSize = U64>>(
+        bytes: &[u8],
+    ) -> Result<Self, BitswapError> {
         let pb = bitswap_pb::Message::decode(bytes)?;
         Self::decode::<M>(pb)
     }
@@ -97,12 +101,11 @@ impl BitswapMessage {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use tiny_multihash::Multihash;
+    use tiny_cid::RAW;
+    use tiny_multihash::{Code, MultihashCode};
 
     pub fn create_cid(bytes: &[u8]) -> Cid {
-        use tiny_cid::RAW;
-        use tiny_multihash::SHA2_256;
-        let digest = Multihash::new(SHA2_256, bytes).unwrap().to_raw().unwrap();
+        let digest = Code::Blake3_256.digest(bytes);
         Cid::new_v1(RAW, digest)
     }
 
@@ -120,7 +123,7 @@ pub(crate) mod tests {
         ];
         for message in &messages {
             assert_eq!(
-                &BitswapMessage::decode::<Multihash>(message.clone().encode()).unwrap(),
+                &BitswapMessage::decode::<Code>(message.clone().encode()).unwrap(),
                 message
             );
         }
