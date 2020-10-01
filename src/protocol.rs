@@ -10,7 +10,7 @@ use futures_codec::{BytesMut, Framed};
 use libp2p::core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use std::io;
 use std::marker::PhantomData;
-use tiny_multihash::MultihashDigest;
+use tiny_multihash::{MultihashCode, U64};
 use unsigned_varint::codec::UviBytes;
 
 #[derive(Clone, Copy, Debug)]
@@ -31,7 +31,7 @@ impl<MH> UpgradeInfo for BitswapProtocolConfig<MH> {
 
 impl<MH, C> InboundUpgrade<C> for BitswapProtocolConfig<MH>
 where
-    MH: MultihashDigest,
+    MH: MultihashCode<AllocSize = U64>,
     C: AsyncRead + AsyncWrite + Unpin,
 {
     type Output = BitswapStreamSink<C>;
@@ -57,7 +57,7 @@ where
 
 impl<MH, C> OutboundUpgrade<C> for BitswapProtocolConfig<MH>
 where
-    MH: MultihashDigest,
+    MH: MultihashCode<AllocSize = U64>,
     C: AsyncRead + AsyncWrite + Unpin,
 {
     type Output = BitswapStreamSink<C>;
@@ -101,7 +101,7 @@ mod tests {
     use async_std::net::{TcpListener, TcpStream};
     use futures::prelude::*;
     use libp2p::core::upgrade;
-    use tiny_multihash::Multihash;
+    use tiny_multihash::Code;
 
     #[async_std::test]
     async fn test_upgrade() {
@@ -110,7 +110,7 @@ mod tests {
         let listener_addr = listener.local_addr().unwrap();
 
         let protocol_config = BitswapProtocolConfig {
-            _marker: PhantomData::<Multihash>,
+            _marker: PhantomData::<Code>,
             max_packet_size: crate::DEFAULT_MAX_PACKET_SIZE,
         };
         let data = vec![42u8; crate::DEFAULT_MAX_PACKET_SIZE - 14];
@@ -147,7 +147,7 @@ mod tests {
         let listener_addr = listener.local_addr().unwrap();
 
         let protocol_config = BitswapProtocolConfig {
-            _marker: PhantomData::<Multihash>,
+            _marker: PhantomData::<Code>,
             max_packet_size: crate::DEFAULT_MAX_PACKET_SIZE,
         };
         let data = vec![42u8; crate::DEFAULT_MAX_PACKET_SIZE - 13];
