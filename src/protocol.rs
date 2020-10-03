@@ -1,176 +1,272 @@
-/// Bitswap wire protocol.
-use crate::error::BitswapError;
-use crate::message::BitswapMessage;
-use core::iter;
-use futures::io::{AsyncRead, AsyncWrite};
-use futures::sink::SinkExt;
-use futures::stream::TryStreamExt;
-use futures::{future, sink, stream};
-use futures_codec::{BytesMut, Framed};
-use libp2p::core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
-use std::io;
+use async_trait::async_trait;
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use libipld::cid::Cid;
+use libipld::store::StoreParams;
+use libp2p::request_response::{ProtocolName, RequestResponseCodec};
+use std::convert::TryFrom;
+use std::io::{self, Write};
 use std::marker::PhantomData;
-use tiny_multihash::{MultihashCode, U64};
-use unsigned_varint::codec::UviBytes;
+use thiserror::Error;
+use unsigned_varint::{aio, io::ReadError};
 
-#[derive(Clone, Copy, Debug)]
-pub struct BitswapProtocolConfig<MH> {
-    pub _marker: PhantomData<MH>,
-    /// Maximum allowed size of a packet.
-    pub max_packet_size: usize,
-}
+// version codec hash size (u64 varint is max 10 bytes) + digest
+const MAX_CID_SIZE: usize = 4 * 10 + 64;
 
-impl<MH> UpgradeInfo for BitswapProtocolConfig<MH> {
-    type Info = &'static [u8];
-    type InfoIter = iter::Once<Self::Info>;
+#[derive(Clone, Debug)]
+pub struct BitswapProtocol;
 
-    fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(b"/ipfs/bitswap/2.0.0")
+impl ProtocolName for BitswapProtocol {
+    fn protocol_name(&self) -> &[u8] {
+        b"/substrate/bitswap/1.0.0"
     }
 }
 
-impl<MH, C> InboundUpgrade<C> for BitswapProtocolConfig<MH>
-where
-    MH: MultihashCode<AllocSize = U64>,
-    C: AsyncRead + AsyncWrite + Unpin,
-{
-    type Output = BitswapStreamSink<C>;
-    type Error = BitswapError;
-    type Future = future::Ready<Result<Self::Output, Self::Error>>;
+#[derive(Clone)]
+pub struct BitswapCodec<P> {
+    _marker: PhantomData<P>,
+    buffer: Vec<u8>,
+}
 
-    fn upgrade_inbound(self, incoming: C, _: Self::Info) -> Self::Future {
-        let mut codec = UviBytes::default();
-        codec.set_max_len(self.max_packet_size);
-
-        future::ok(
-            Framed::new(incoming, codec)
-                .err_into()
-                .with::<_, _, fn(_) -> _, _>(|message: BitswapMessage| {
-                    future::ready(Ok(io::Cursor::new(message.into_bytes())))
-                })
-                .and_then::<_, fn(_) -> _>(|bytes| {
-                    future::ready(BitswapMessage::from_bytes::<MH>(&bytes))
-                }),
-        )
+impl<P: StoreParams> Default for BitswapCodec<P> {
+    fn default() -> Self {
+        let capacity = usize::max(P::MAX_BLOCK_SIZE, MAX_CID_SIZE) + 1;
+        debug_assert!(capacity <= u32::MAX as usize);
+        Self {
+            _marker: PhantomData,
+            buffer: Vec::with_capacity(capacity),
+        }
     }
 }
 
-impl<MH, C> OutboundUpgrade<C> for BitswapProtocolConfig<MH>
-where
-    MH: MultihashCode<AllocSize = U64>,
-    C: AsyncRead + AsyncWrite + Unpin,
-{
-    type Output = BitswapStreamSink<C>;
-    type Error = BitswapError;
-    type Future = future::Ready<Result<Self::Output, Self::Error>>;
+#[async_trait]
+impl<P: StoreParams> RequestResponseCodec for BitswapCodec<P> {
+    type Protocol = BitswapProtocol;
+    type Request = BitswapRequest;
+    type Response = BitswapResponse;
 
-    #[inline]
-    fn upgrade_outbound(self, outgoing: C, _: Self::Info) -> Self::Future {
-        let mut codec = UviBytes::default();
-        codec.set_max_len(self.max_packet_size);
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Send + Unpin,
+    {
+        let msg_len = u32_to_usize(aio::read_u32(&mut *io).await.map_err(|e| match e {
+            ReadError::Io(e) => e,
+            err => other(err),
+        })?);
+        if msg_len > MAX_CID_SIZE + 1 {
+            return Err(invalid_data(MessageTooLarge(msg_len)));
+        }
+        self.buffer.resize(msg_len, 0);
+        io.read_exact(&mut self.buffer).await?;
+        let request = BitswapRequest::from_bytes(&self.buffer).map_err(invalid_data)?;
+        Ok(request)
+    }
 
-        future::ok(
-            Framed::new(outgoing, codec)
-                .err_into()
-                .with::<_, _, fn(_) -> _, _>(|message: BitswapMessage| {
-                    future::ready(Ok(io::Cursor::new(message.into_bytes())))
-                })
-                .and_then::<_, fn(_) -> _>(|bytes| {
-                    future::ready(BitswapMessage::from_bytes::<MH>(&bytes))
-                }),
-        )
+    async fn read_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Send + Unpin,
+    {
+        let msg_len = u32_to_usize(aio::read_u32(&mut *io).await.map_err(|e| match e {
+            ReadError::Io(e) => e,
+            err => other(err),
+        })?);
+        if msg_len > P::MAX_BLOCK_SIZE + 1 {
+            return Err(invalid_data(MessageTooLarge(msg_len)));
+        }
+        self.buffer.resize(msg_len, 0);
+        io.read_exact(&mut self.buffer).await?;
+        let response = BitswapResponse::from_bytes(&self.buffer).map_err(invalid_data)?;
+        Ok(response)
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Send + Unpin,
+    {
+        self.buffer.clear();
+        req.write_to(&mut self.buffer)?;
+        if self.buffer.len() > MAX_CID_SIZE + 1 {
+            return Err(invalid_data(MessageTooLarge(self.buffer.len())));
+        }
+        let mut buf = unsigned_varint::encode::u32_buffer();
+        let msg_len = unsigned_varint::encode::u32(self.buffer.len() as u32, &mut buf);
+        io.write_all(&msg_len).await?;
+        io.write_all(&self.buffer).await?;
+        Ok(())
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Send + Unpin,
+    {
+        self.buffer.clear();
+        res.write_to(&mut self.buffer)?;
+        if self.buffer.len() > P::MAX_BLOCK_SIZE + 1 {
+            return Err(invalid_data(MessageTooLarge(self.buffer.len())));
+        }
+        let mut buf = unsigned_varint::encode::u32_buffer();
+        let msg_len = unsigned_varint::encode::u32(self.buffer.len() as u32, &mut buf);
+        io.write_all(&msg_len).await?;
+        io.write_all(&self.buffer).await?;
+        Ok(())
     }
 }
 
-pub type BitswapStreamSink<C> = stream::AndThen<
-    sink::With<
-        stream::ErrInto<Framed<C, UviBytes<io::Cursor<Vec<u8>>>>, BitswapError>,
-        io::Cursor<Vec<u8>>,
-        BitswapMessage,
-        future::Ready<Result<io::Cursor<Vec<u8>>, BitswapError>>,
-        fn(BitswapMessage) -> future::Ready<Result<io::Cursor<Vec<u8>>, BitswapError>>,
-    >,
-    future::Ready<Result<BitswapMessage, BitswapError>>,
-    fn(BytesMut) -> future::Ready<Result<BitswapMessage, BitswapError>>,
->;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestType {
+    Have,
+    Block,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BitswapRequest {
+    pub ty: RequestType,
+    pub cid: Cid,
+}
+
+impl BitswapRequest {
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        match self {
+            BitswapRequest {
+                ty: RequestType::Have,
+                cid,
+            } => {
+                w.write_all(&[0])?;
+                cid.write_bytes(&mut *w).map_err(other)?;
+            }
+            BitswapRequest {
+                ty: RequestType::Block,
+                cid,
+            } => {
+                w.write_all(&[1])?;
+                cid.write_bytes(&mut *w).map_err(other)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        let ty = match bytes[0] {
+            0 => RequestType::Have,
+            1 => RequestType::Block,
+            c => return Err(invalid_data(UnknownMessageType(c))),
+        };
+        let cid = Cid::try_from(&bytes[1..]).map_err(invalid_data)?;
+        Ok(Self { ty, cid })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BitswapResponse {
+    Have(bool),
+    Block(Vec<u8>),
+}
+
+impl BitswapResponse {
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        match self {
+            BitswapResponse::Have(have) => {
+                if *have {
+                    w.write_all(&[0])?;
+                } else {
+                    w.write_all(&[2])?;
+                }
+            }
+            BitswapResponse::Block(data) => {
+                w.write_all(&[1])?;
+                w.write_all(&data)?;
+            }
+        };
+        Ok(())
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        let res = match bytes[0] {
+            0 | 2 => BitswapResponse::Have(bytes[0] == 0),
+            1 => BitswapResponse::Block(bytes[1..].to_vec()),
+            c => return Err(invalid_data(UnknownMessageType(c))),
+        };
+        Ok(res)
+    }
+}
+
+fn invalid_data<E: std::error::Error + Send + Sync + 'static>(e: E) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+fn other<E: std::error::Error + Send + Sync + 'static>(e: E) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e)
+}
+
+#[cfg(any(target_pointer_width = "64", target_pointer_width = "32"))]
+fn u32_to_usize(n: u32) -> usize {
+    n as usize
+}
+
+#[derive(Debug, Error)]
+#[error("unknown message type {0}")]
+pub struct UnknownMessageType(u8);
+
+#[derive(Debug, Error)]
+#[error("message too large {0}")]
+pub struct MessageTooLarge(usize);
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::message::tests::create_cid;
-    use async_std::net::{TcpListener, TcpStream};
-    use futures::prelude::*;
-    use libp2p::core::upgrade;
-    use tiny_multihash::Code;
+    use libipld::cid::RAW;
+    use libipld::multihash::{Code, MultihashCode};
 
-    #[async_std::test]
-    async fn test_upgrade() {
-        env_logger::try_init().ok();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let listener_addr = listener.local_addr().unwrap();
-
-        let protocol_config = BitswapProtocolConfig {
-            _marker: PhantomData::<Code>,
-            max_packet_size: crate::DEFAULT_MAX_PACKET_SIZE,
-        };
-        let data = vec![42u8; crate::DEFAULT_MAX_PACKET_SIZE - 14];
-        let cid = create_cid(&data);
-        let message = BitswapMessage::BlockResponse(cid, data);
-        let message2 = message.clone();
-
-        let server = async move {
-            let incoming = listener.incoming().into_future().await.0.unwrap().unwrap();
-            let mut channel = upgrade::apply_inbound(incoming, protocol_config)
-                .await
-                .unwrap();
-            let message = channel.next().await.unwrap().unwrap();
-            assert_eq!(message, message2);
-        };
-
-        let client = async move {
-            let stream = TcpStream::connect(&listener_addr).await.unwrap();
-            let mut channel =
-                upgrade::apply_outbound(stream, protocol_config, upgrade::Version::V1)
-                    .await
-                    .unwrap();
-            channel.send(message).await.unwrap();
-        };
-
-        future::select(Box::pin(server), Box::pin(client)).await;
+    pub fn create_cid(bytes: &[u8]) -> Cid {
+        let digest = Code::Blake3_256.digest(bytes);
+        Cid::new_v1(RAW, digest)
     }
 
-    #[async_std::test]
-    #[should_panic]
-    async fn test_max_message_size() {
-        env_logger::try_init().ok();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let listener_addr = listener.local_addr().unwrap();
+    #[test]
+    fn test_request_encode_decode() {
+        let requests = [
+            BitswapRequest {
+                ty: RequestType::Have,
+                cid: create_cid(&b"have_request"[..]),
+            },
+            BitswapRequest {
+                ty: RequestType::Block,
+                cid: create_cid(&b"block_request"[..]),
+            },
+        ];
+        let mut buf = Vec::with_capacity(MAX_CID_SIZE + 1);
+        for request in &requests {
+            buf.clear();
+            request.write_to(&mut buf).unwrap();
+            assert_eq!(&BitswapRequest::from_bytes(&buf).unwrap(), request);
+        }
+    }
 
-        let protocol_config = BitswapProtocolConfig {
-            _marker: PhantomData::<Code>,
-            max_packet_size: crate::DEFAULT_MAX_PACKET_SIZE,
-        };
-        let data = vec![42u8; crate::DEFAULT_MAX_PACKET_SIZE - 13];
-        let cid = create_cid(&data);
-        let message = BitswapMessage::BlockResponse(cid, data);
-
-        let server = async move {
-            let incoming = listener.incoming().into_future().await.0.unwrap().unwrap();
-            let mut channel = upgrade::apply_inbound(incoming, protocol_config)
-                .await
-                .unwrap();
-            channel.next().await.unwrap().unwrap();
-        };
-
-        let client = async move {
-            let stream = TcpStream::connect(&listener_addr).await.unwrap();
-            let mut channel =
-                upgrade::apply_outbound(stream, protocol_config, upgrade::Version::V1)
-                    .await
-                    .unwrap();
-            channel.send(message).await.unwrap();
-        };
-
-        future::select(Box::pin(server), Box::pin(client)).await;
+    #[test]
+    fn test_response_encode_decode() {
+        let responses = [
+            BitswapResponse::Have(true),
+            BitswapResponse::Have(false),
+            BitswapResponse::Block(b"block_response".to_vec()),
+        ];
+        let mut buf = Vec::with_capacity(13 + 1);
+        for response in &responses {
+            buf.clear();
+            response.write_to(&mut buf).unwrap();
+            assert_eq!(&BitswapResponse::from_bytes(&buf).unwrap(), response);
+        }
     }
 }
