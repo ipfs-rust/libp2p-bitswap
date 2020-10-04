@@ -291,6 +291,22 @@ impl QueryManager {
         }
     }
 
+    pub fn cancel_get(&mut self, cid: Cid) {
+        self._cancel_get(cid, true);
+    }
+
+    fn _cancel_get(&mut self, cid: Cid, user: bool) {
+        let query = Query {
+            ty: QueryType::Get,
+            cid,
+        };
+        if self.user.remove(&query) == user {
+            self.get.remove(&cid);
+            self.progress.remove(&query);
+            log::trace!("cancel {}", query);
+        }
+    }
+
     pub fn sync(&mut self, cid: Cid, syncer: Box<dyn BitswapSync>) {
         if !self.sync.contains(&cid) {
             let query = Query {
@@ -302,6 +318,22 @@ impl QueryManager {
             self.sync.insert(sync);
             self.progress.insert(query);
             self.user.insert(query);
+        }
+    }
+
+    pub fn cancel_sync(&mut self, cid: Cid) {
+        let query = Query {
+            ty: QueryType::Sync,
+            cid,
+        };
+        if self.user.remove(&query) {
+            if let Some(sync) = self.sync.take(&cid) {
+                for cid in sync.requests {
+                    self._cancel_get(cid, false);
+                }
+            }
+            self.progress.remove(&query);
+            log::trace!("cancel {}", query);
         }
     }
 
