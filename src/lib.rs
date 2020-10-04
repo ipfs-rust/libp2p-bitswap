@@ -4,3 +4,4 @@ mod protocol;
 mod query;
 
 pub use crate::behaviour::{Bitswap, BitswapConfig, BitswapEvent, BitswapStore};
+pub use crate::query::BitswapSync;

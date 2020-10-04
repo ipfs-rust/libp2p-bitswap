@@ -45,7 +45,6 @@ pub enum BitswapEvent {
 pub struct BitswapConfig<P, S> {
     _marker: PhantomData<P>,
     store: S,
-    pub credit_timeout: Duration,
     pub request_timeout: Duration,
     pub connection_keep_alive: Duration,
     pub receive_limit: NonZeroU16,
@@ -56,7 +55,6 @@ impl<P: StoreParams, S: BitswapStore> BitswapConfig<P, S> {
         Self {
             _marker: PhantomData,
             store,
-            credit_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(3),
             connection_keep_alive: Duration::from_secs(10),
             receive_limit: NonZeroU16::new(20).expect("20 > 0"),
@@ -104,8 +102,16 @@ impl<P: StoreParams, S: BitswapStore> Bitswap<P, S> {
         self.query_manager.get(cid);
     }
 
+    pub fn cancel_get(&mut self, cid: Cid) {
+        self.query_manager.cancel_get(cid);
+    }
+
     pub fn sync(&mut self, cid: Cid, syncer: Box<dyn BitswapSync>) {
         self.query_manager.sync(cid, syncer);
+    }
+
+    pub fn cancel_sync(&mut self, cid: Cid) {
+        self.query_manager.cancel_sync(cid);
     }
 
     pub fn add_provider(&mut self, cid: Cid, peer_id: PeerId) {
@@ -326,8 +332,9 @@ impl<P: StoreParams, S: BitswapStore> NetworkBehaviour for Bitswap<P, S> {
                         request_id,
                         error
                     );
-                    let cid = self.requests.remove(&request_id).unwrap();
-                    self.query_manager.complete_request(cid, peer, false);
+                    if let Some(cid) = self.requests.remove(&request_id) {
+                        self.query_manager.complete_request(cid, peer, false);
+                    }
                 }
                 RequestResponseEvent::InboundFailure {
                     peer,
@@ -515,6 +522,22 @@ mod tests {
     }
 
     #[async_std::test]
+    async fn test_bitswap_cancel_get() {
+        env_logger::try_init().ok();
+        let peer1 = Peer::new();
+        let mut peer2 = Peer::new();
+        peer2.add_address(&peer1);
+
+        let block = create_block(ipld!(&b"hello world"[..]));
+        peer1.store().insert(*block.cid(), block.data().to_vec());
+        peer1.spawn("peer1");
+
+        peer2.swarm().get(*block.cid());
+        peer2.swarm().cancel_get(*block.cid());
+        assert!(peer2.swarm().next().now_or_never().is_none());
+    }
+
+    #[async_std::test]
     async fn test_bitswap_sync() {
         env_logger::try_init().ok();
         let peer1 = Peer::new();
@@ -559,5 +582,22 @@ mod tests {
         assert_eq!(peer2.store().get(b0.cid()), Some(b0.data().to_vec()));
         assert_eq!(peer2.store().get(b1.cid()), Some(b1.data().to_vec()));
         assert_eq!(peer2.store().get(b2.cid()), Some(b2.data().to_vec()));
+    }
+
+    #[async_std::test]
+    async fn test_bitswap_cancel_sync() {
+        env_logger::try_init().ok();
+        let peer1 = Peer::new();
+        let mut peer2 = Peer::new();
+        peer2.add_address(&peer1);
+
+        let block = create_block(ipld!(&b"hello world"[..]));
+        peer1.store().insert(*block.cid(), block.data().to_vec());
+        peer1.spawn("peer1");
+
+        let syncer = Box::new(Syncer(peer2.store().clone()));
+        peer2.swarm().sync(*block.cid(), syncer);
+        peer2.swarm().cancel_sync(*block.cid());
+        assert!(peer2.swarm().next().now_or_never().is_none());
     }
 }
