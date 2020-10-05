@@ -1,6 +1,6 @@
 [package]
 name = "libp2p-bitswap"
-version = "0.7.1"
+version = "0.8.0"
 authors = ["David Craven <david@craven.ch>"]
 edition = "2018"
 description = "Implementation of the ipfs bitswap protocol."
@@ -22,6 +22,3 @@ async-std = { version = "1.6.5", features = ["attributes"] }
 env_logger = "0.7.1"
 libipld = { version = "0.7.0", default-features = false, features = ["dag-cbor"] }
 libp2p = "0.28.1"
-
-[patch.crates-io]
-libipld = { path = "../rust-ipld" }
