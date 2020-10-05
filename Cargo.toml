@@ -12,7 +12,7 @@ async-trait = "0.1.41"
 fnv = "1.0.7"
 futures = "0.3.5"
 libipld = { version = "0.7.0", default-features = false }
-libp2p = { version = "0.28.1", default-features = false }
+libp2p = { version = "0.28.1", default-features = false, features = ["request-response"] }
 log = "0.4.11"
 thiserror = "1.0.20"
 unsigned-varint = { version = "0.5.1", features = ["futures", "std"] }
