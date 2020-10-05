@@ -520,6 +520,10 @@ mod tests {
             }
             Box::new(std::iter::empty())
         }
+
+        fn contains(&self, cid: &Cid) -> bool {
+            self.0.contains(cid)
+        }
     }
 
     #[async_std::test]
