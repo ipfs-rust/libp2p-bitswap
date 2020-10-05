@@ -10,6 +10,9 @@ use std::sync::Arc;
 pub trait BitswapSync: Send + Sync + 'static {
     /// Returns the list of blocks that need to be synced.
     fn references(&self, cid: &Cid) -> Box<dyn Iterator<Item = Cid>>;
+
+    /// Returns if a cid needs to be synced.
+    fn contains(&self, cid: &Cid) -> bool;
 }
 
 /// Query type.
@@ -246,13 +249,17 @@ impl SyncQuery {
             requests: Default::default(),
             events: Default::default(),
         };
-        me.start_request(cid, Default::default());
+        me.start_request(&cid, Default::default());
         me
     }
 
-    fn start_request(&mut self, cid: Cid, initial_set: FnvHashSet<PeerId>) {
-        if self.requests.insert(cid) {
-            let req = GetQuery::new(cid, initial_set);
+    fn start_request(&mut self, cid: &Cid, initial_set: FnvHashSet<PeerId>) {
+        if self.syncer.contains(cid) {
+            for cid in self.syncer.references(cid) {
+                self.start_request(&cid, initial_set.clone());
+            }
+        } else if self.requests.insert(*cid) {
+            let req = GetQuery::new(*cid, initial_set);
             self.events.push_back(SyncQueryEvent::Query(req));
         }
     }
@@ -261,24 +268,27 @@ impl SyncQuery {
         if self.requests.remove(&cid) {
             match res {
                 Ok(initial_set) => {
-                    for cid in self.syncer.references(cid) {
-                        self.start_request(cid, initial_set.clone());
-                    }
-                    if self.requests.is_empty() {
-                        self.events.push_back(SyncQueryEvent::Complete(Ok(())));
-                    }
+                    self.start_request(cid, initial_set.clone());
                 }
                 Err(()) => {
                     self.events
                         .push_back(SyncQueryEvent::Complete(Err(BlockNotFound(*cid))));
                 }
             }
+            true
+        } else {
+            false
         }
-        !self.events.is_empty()
     }
 
     pub fn next(&mut self) -> Option<SyncQueryEvent> {
-        self.events.pop_front()
+        if let Some(event) = self.events.pop_front() {
+            return Some(event);
+        }
+        if self.requests.is_empty() {
+            return Some(SyncQueryEvent::Complete(Ok(())));
+        }
+        None
     }
 }
 
