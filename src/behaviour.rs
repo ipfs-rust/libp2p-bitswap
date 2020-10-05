@@ -25,36 +25,48 @@ use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters};
 use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::error::Error;
-use std::marker::PhantomData;
 use std::num::NonZeroU16;
+use std::sync::Arc;
 use std::time::Duration;
 
-pub trait BitswapStore: Clone + Send + Sync + 'static {
+/// Bitswap store abstraction.
+pub trait BitswapStore<P: StoreParams>: Send + Sync + 'static {
+    /// Does the store contain a cid. Used for replying to have requests.
     fn contains(&self, cid: &Cid) -> bool;
+    /// The data matching a cid. Used for replying to block requests.
     fn get(&self, cid: &Cid) -> Option<Vec<u8>>;
+    /// Insert a block into the store. Used when receiving a block response.
     fn insert(&self, cid: Cid, data: Vec<u8>);
 }
 
+/// Event emitted by the bitswap behaviour.
 #[derive(Clone, Debug)]
 pub enum BitswapEvent {
+    /// The sync algorithm wants to know the providers of a block. To handle
+    /// this event use the `add_provider(cid, peer_id)` and `complete_get_providers(cid)`
+    /// methods.
     GetProviders(Cid),
+    /// A get or sync query completed.
     QueryComplete(Query, QueryResult),
 }
 
 /// Bitswap configuration.
-pub struct BitswapConfig<P, S> {
-    _marker: PhantomData<P>,
-    store: S,
+pub struct BitswapConfig<P: StoreParams> {
+    /// The bitswap store.
+    pub store: Box<dyn BitswapStore<P>>,
+    /// Timeout of a request.
     pub request_timeout: Duration,
+    /// Time a connection is kept alive.
     pub connection_keep_alive: Duration,
+    /// The number of concurrent requests per peer.
     pub receive_limit: NonZeroU16,
 }
 
-impl<P: StoreParams, S: BitswapStore> BitswapConfig<P, S> {
-    pub fn new(store: S) -> Self {
+impl<P: StoreParams> BitswapConfig<P> {
+    /// Creates a new `BitswapConfig`.
+    pub fn new<S: BitswapStore<P>>(store: S) -> Self {
         Self {
-            _marker: PhantomData,
-            store,
+            store: Box::new(store),
             request_timeout: Duration::from_secs(3),
             connection_keep_alive: Duration::from_secs(10),
             receive_limit: NonZeroU16::new(20).expect("20 > 0"),
@@ -62,10 +74,10 @@ impl<P: StoreParams, S: BitswapStore> BitswapConfig<P, S> {
     }
 }
 
-/// Network behaviour that handles sending and receiving IPFS blocks.
-pub struct Bitswap<P: StoreParams, S: BitswapStore> {
+/// Network behaviour that handles sending and receiving blocks.
+pub struct Bitswap<P: StoreParams> {
     /// Bitswap config.
-    config: BitswapConfig<P, S>,
+    config: BitswapConfig<P>,
     /// Inner behaviour.
     inner: Throttled<BitswapCodec<P>>,
     /// Query manager.
@@ -76,9 +88,9 @@ pub struct Bitswap<P: StoreParams, S: BitswapStore> {
     requests: FnvHashMap<RequestId, Cid>,
 }
 
-impl<P: StoreParams, S: BitswapStore> Bitswap<P, S> {
-    /// Creates a new `Bitswap`.
-    pub fn new(config: BitswapConfig<P, S>) -> Self {
+impl<P: StoreParams> Bitswap<P> {
+    /// Creates a new `Bitswap` behaviour.
+    pub fn new(config: BitswapConfig<P>) -> Self {
         let mut rr_config = RequestResponseConfig::default();
         rr_config.set_connection_keep_alive(config.connection_keep_alive);
         rr_config.set_request_timeout(config.request_timeout);
@@ -94,36 +106,43 @@ impl<P: StoreParams, S: BitswapStore> Bitswap<P, S> {
         }
     }
 
+    /// Adds an address for a peer.
     pub fn add_address(&mut self, peer_id: &PeerId, addr: Multiaddr) {
         self.inner.add_address(peer_id, addr);
     }
 
+    /// Starts a get query.
     pub fn get(&mut self, cid: Cid) {
         self.query_manager.get(cid);
     }
 
+    /// Cancels an in progress get query.
     pub fn cancel_get(&mut self, cid: Cid) {
         self.query_manager.cancel_get(cid);
     }
 
-    pub fn sync(&mut self, cid: Cid, syncer: Box<dyn BitswapSync>) {
+    /// Starts a sync query.
+    pub fn sync(&mut self, cid: Cid, syncer: Arc<dyn BitswapSync>) {
         self.query_manager.sync(cid, syncer);
     }
 
+    /// Cancels an in progress sync query.
     pub fn cancel_sync(&mut self, cid: Cid) {
         self.query_manager.cancel_sync(cid);
     }
 
+    /// Adds a provider for a cid. Used for handling the `GetProviders` event.
     pub fn add_provider(&mut self, cid: Cid, peer_id: PeerId) {
         self.query_manager.add_provider(cid, peer_id);
     }
 
+    /// All providers where added. Used for handling the `GetProviders` event.
     pub fn complete_get_providers(&mut self, cid: Cid) {
         self.query_manager.complete_get_providers(cid);
     }
 }
 
-impl<P: StoreParams, S: BitswapStore> NetworkBehaviour for Bitswap<P, S> {
+impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     type ProtocolsHandler = <Throttled<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler;
     type OutEvent = BitswapEvent;
 
@@ -383,6 +402,7 @@ mod tests {
     use libp2p::yamux::Config as YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
     use std::io::{Error, ErrorKind};
+    use std::marker::PhantomData;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -411,33 +431,45 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct Store(Arc<Mutex<FnvHashMap<Cid, Vec<u8>>>>);
+    struct Store<P: StoreParams> {
+        marker: PhantomData<P>,
+        inner: Arc<Mutex<FnvHashMap<Cid, Vec<u8>>>>,
+    }
 
-    impl BitswapStore for Store {
+    impl<P: StoreParams> Store<P> {
+        fn new() -> Self {
+            Self {
+                marker: PhantomData,
+                inner: Default::default(),
+            }
+        }
+    }
+
+    impl<P: StoreParams> BitswapStore<P> for Store<P> {
         fn contains(&self, cid: &Cid) -> bool {
-            self.0.lock().unwrap().contains_key(cid)
+            self.inner.lock().unwrap().contains_key(cid)
         }
 
         fn get(&self, cid: &Cid) -> Option<Vec<u8>> {
-            self.0.lock().unwrap().get(cid).cloned()
+            self.inner.lock().unwrap().get(cid).cloned()
         }
 
         fn insert(&self, cid: Cid, data: Vec<u8>) {
-            self.0.lock().unwrap().insert(cid, data);
+            self.inner.lock().unwrap().insert(cid, data);
         }
     }
 
     struct Peer {
         peer_id: PeerId,
         addr: Multiaddr,
-        store: Store,
-        swarm: Swarm<Bitswap<DefaultParams, Store>>,
+        store: Store<DefaultParams>,
+        swarm: Swarm<Bitswap<DefaultParams>>,
     }
 
     impl Peer {
         fn new() -> Self {
             let (peer_id, trans) = mk_transport();
-            let store = Store::default();
+            let store = Store::new();
             let mut swarm = Swarm::new(
                 trans,
                 Bitswap::new(BitswapConfig::new(store.clone())),
@@ -458,11 +490,11 @@ mod tests {
             self.swarm.add_address(&peer.peer_id, peer.addr.clone());
         }
 
-        fn store(&self) -> &Store {
+        fn store(&self) -> &Store<DefaultParams> {
             &self.store
         }
 
-        fn swarm(&mut self) -> &mut Swarm<Bitswap<DefaultParams, Store>> {
+        fn swarm(&mut self) -> &mut Swarm<Bitswap<DefaultParams>> {
             &mut self.swarm
         }
 
@@ -476,9 +508,9 @@ mod tests {
         }
     }
 
-    struct Syncer(Store);
+    struct Syncer<P: StoreParams>(Store<P>);
 
-    impl BitswapSync for Syncer {
+    impl<P: StoreParams> BitswapSync for Syncer<P> {
         fn references(&self, cid: &Cid) -> Box<dyn Iterator<Item = Cid>> {
             if let Some(data) = self.0.get(cid) {
                 let block = Block::<DefaultParams>::new_unchecked(*cid, data);
@@ -560,7 +592,7 @@ mod tests {
         peer1.store().insert(*b2.cid(), b2.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let syncer = Box::new(Syncer(peer2.store().clone()));
+        let syncer = Arc::new(Syncer(peer2.store().clone()));
         peer2.swarm().sync(*b2.cid(), syncer);
         assert!(matches!(
             peer2.swarm().next().await,
@@ -595,7 +627,7 @@ mod tests {
         peer1.store().insert(*block.cid(), block.data().to_vec());
         peer1.spawn("peer1");
 
-        let syncer = Box::new(Syncer(peer2.store().clone()));
+        let syncer = Arc::new(Syncer(peer2.store().clone()));
         peer2.swarm().sync(*block.cid(), syncer);
         peer2.swarm().cancel_sync(*block.cid());
         assert!(peer2.swarm().next().now_or_never().is_none());

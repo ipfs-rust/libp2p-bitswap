@@ -4,14 +4,20 @@ use libipld::cid::Cid;
 use libipld::error::BlockNotFound;
 use libp2p::PeerId;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
+/// Bitswap sync trait for customizing the syncing behaviour.
 pub trait BitswapSync: Send + Sync + 'static {
+    /// Returns the list of blocks that need to be synced.
     fn references(&self, cid: &Cid) -> Box<dyn Iterator<Item = Cid>>;
 }
 
+/// Query type.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum QueryType {
+    /// Get query.
     Get,
+    /// Sync query.
     Sync,
 }
 
@@ -24,9 +30,12 @@ impl std::fmt::Display for QueryType {
     }
 }
 
+/// Query.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Query {
+    /// Query type.
     pub ty: QueryType,
+    /// Cid.
     pub cid: Cid,
 }
 
@@ -36,12 +45,17 @@ impl std::fmt::Display for Query {
     }
 }
 
+/// The result of a `Query`.
 pub type QueryResult = core::result::Result<(), BlockNotFound>;
 
+/// Event emitted by a query.
 #[derive(Debug)]
 pub enum QueryEvent {
+    /// The query needs to know the providers of a cid.
     GetProviders(Cid),
+    /// The query wants to make a have or block request to a peer for cid.
     Request(PeerId, Cid, RequestType),
+    /// The query completed with a result.
     Complete(Query, QueryResult),
 }
 
@@ -199,7 +213,7 @@ enum SyncQueryEvent {
 
 struct SyncQuery {
     cid: Cid,
-    syncer: Box<dyn BitswapSync>,
+    syncer: Arc<dyn BitswapSync>,
     requests: FnvHashSet<Cid>,
     events: VecDeque<SyncQueryEvent>,
 }
@@ -225,7 +239,7 @@ impl PartialEq for SyncQuery {
 impl Eq for SyncQuery {}
 
 impl SyncQuery {
-    pub fn new(cid: Cid, syncer: Box<dyn BitswapSync>) -> Self {
+    pub fn new(cid: Cid, syncer: Arc<dyn BitswapSync>) -> Self {
         let mut me = Self {
             cid,
             syncer,
@@ -307,7 +321,7 @@ impl QueryManager {
         }
     }
 
-    pub fn sync(&mut self, cid: Cid, syncer: Box<dyn BitswapSync>) {
+    pub fn sync(&mut self, cid: Cid, syncer: Arc<dyn BitswapSync>) {
         if !self.sync.contains(&cid) {
             let query = Query {
                 ty: QueryType::Sync,
