@@ -394,19 +394,18 @@ mod tests {
     use libipld::multihash::Code;
     use libipld::store::DefaultParams;
     use libp2p::core::muxing::StreamMuxerBox;
-    use libp2p::core::transport::boxed::Boxed;
     use libp2p::core::transport::upgrade::Version;
+    use libp2p::core::transport::Boxed;
     use libp2p::identity;
     use libp2p::noise::{Keypair, NoiseConfig, X25519Spec};
     use libp2p::tcp::TcpConfig;
-    use libp2p::yamux::Config as YamuxConfig;
+    use libp2p::yamux::YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
-    use std::io::{Error, ErrorKind};
     use std::marker::PhantomData;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    fn mk_transport() -> (PeerId, Boxed<(PeerId, StreamMuxerBox), Error>) {
+    fn mk_transport() -> (PeerId, Boxed<(PeerId, StreamMuxerBox)>) {
         let id_key = identity::Keypair::generate_ed25519();
         let peer_id = id_key.public().into_peer_id();
         let dh_key = Keypair::<X25519Spec>::new()
@@ -420,8 +419,6 @@ mod tests {
             .authenticate(noise)
             .multiplex(YamuxConfig::default())
             .timeout(Duration::from_secs(20))
-            .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
-            .map_err(|err| Error::new(ErrorKind::Other, err))
             .boxed();
         (peer_id, transport)
     }
