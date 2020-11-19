@@ -219,6 +219,9 @@ struct SyncQuery {
     syncer: Arc<dyn BitswapSync>,
     requests: FnvHashSet<Cid>,
     events: VecDeque<SyncQueryEvent>,
+    visited: FnvHashSet<Cid>,
+    num_requests: usize,
+    num_calls_start_request: usize,
 }
 
 impl std::borrow::Borrow<Cid> for SyncQuery {
@@ -248,19 +251,28 @@ impl SyncQuery {
             syncer,
             requests: Default::default(),
             events: Default::default(),
+            visited: Default::default(),
+            num_requests: 0,
+            num_calls_start_request: 0,
         };
         me.start_request(&cid, Default::default());
         me
     }
 
     fn start_request(&mut self, cid: &Cid, initial_set: FnvHashSet<PeerId>) {
+        if self.visited.contains(cid) {
+            return;
+        }
+        self.num_calls_start_request += 1;
         if self.syncer.contains(cid) {
+            self.visited.insert(*cid);
             for cid in self.syncer.references(cid) {
                 self.start_request(&cid, initial_set.clone());
             }
         } else if self.requests.insert(*cid) {
             let req = GetQuery::new(*cid, initial_set);
             self.events.push_back(SyncQueryEvent::Query(req));
+            self.num_requests += 1;
         }
     }
 
@@ -286,6 +298,8 @@ impl SyncQuery {
             return Some(event);
         }
         if self.requests.is_empty() {
+            log::trace!("num requests {}", self.num_requests);
+            log::trace!("num calls {}", self.num_calls_start_request);
             return Some(SyncQueryEvent::Complete(Ok(())));
         }
         None
