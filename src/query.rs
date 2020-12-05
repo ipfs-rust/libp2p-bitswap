@@ -161,13 +161,18 @@ impl GetQuery {
                 self.complete = have;
             }
         }
+        let have_set = self.have_set.as_mut().unwrap();
         if have {
-            self.have_set.as_mut().unwrap().insert(peer.clone());
+            have_set.insert(peer);
         } else {
-            self.have_set.as_mut().unwrap().remove(&peer);
+            have_set.remove(&peer);
         }
-        if !self.complete && have && self.block_request.is_none() {
-            self.start_request(peer);
+        if !self.complete && self.block_request.is_none() {
+            let peer = have_set.iter().next().map(|peer| peer.to_owned());
+            if let Some(peer) = peer {
+                have_set.remove(&peer);
+                self.start_request(peer);
+            }
         }
     }
 
@@ -521,6 +526,50 @@ impl QueryManager {
 mod tests {
     use super::*;
 
+    mod assert_query {
+        use super::*;
+
+        pub(super) fn is_pending(query: &mut GetQuery) {
+            assert!(matches!(query.next(), None));
+        }
+
+        pub(super) fn is_completed(query: &mut GetQuery, expected_set: FnvHashSet<PeerId>) {
+            assert!(
+                matches!(query.next(), Some(GetQueryEvent::Complete(Ok(set))) if set == expected_set)
+            );
+        }
+
+        pub(super) fn wants_have(query: &mut GetQuery, cid: &Cid) -> PeerId {
+            assert_request(query, cid, RequestType::Have)
+        }
+
+        pub(super) fn wants_block(query: &mut GetQuery, cid: &Cid) -> PeerId {
+            assert_request(query, cid, RequestType::Block)
+        }
+
+        pub(super) fn wants_block_from(query: &mut GetQuery, cid: &Cid, peer: &PeerId) {
+            assert_eq!(assert_request(query, cid, RequestType::Block), *peer);
+        }
+
+        fn assert_request(
+            query: &mut GetQuery,
+            expected_cid: &Cid,
+            expected_type: RequestType,
+        ) -> PeerId {
+            let next_ = query.next();
+            let result = match &next_ {
+                Some(GetQueryEvent::Request(peer_id, cid, type_))
+                    if cid == expected_cid && *type_ == expected_type =>
+                {
+                    Some(peer_id.to_owned())
+                }
+                _ => None,
+            };
+            assert!(result.is_some(), format!("actual: {:?}", next_));
+            result.unwrap()
+        }
+    }
+
     #[test]
     fn test_get_query_block_not_found() {
         let mut initial_set = FnvHashSet::default();
@@ -640,5 +689,61 @@ mod tests {
         assert!(
             matches!(query.next(), Some(GetQueryEvent::Complete(Ok(set))) if set == provider_set)
         );
+    }
+
+    #[test]
+    fn test_gets_block_from_spare_if_first_request_fails_before_have_is_received() {
+        let initial_set = {
+            let mut set = FnvHashSet::default();
+            set.insert(PeerId::random());
+            set.insert(PeerId::random());
+            set
+        };
+        let cid = Cid::default();
+        let mut query = GetQuery::new(cid, initial_set);
+
+        let first_peer = assert_query::wants_block(&mut query, &cid);
+        let second_peer = assert_query::wants_have(&mut query, &cid);
+
+        query.complete_request(first_peer, false);
+        assert_query::is_pending(&mut query);
+
+        query.complete_request(second_peer.to_owned(), true);
+        assert_query::wants_block_from(&mut query, &cid, &second_peer);
+
+        query.complete_request(second_peer.to_owned(), true);
+        assert_query::is_completed(&mut query, {
+            let mut set = FnvHashSet::default();
+            set.insert(second_peer);
+            set
+        });
+    }
+
+    #[test]
+    fn test_gets_block_from_spare_if_first_request_fails_after_have_is_received() {
+        let initial_set = {
+            let mut set = FnvHashSet::default();
+            set.insert(PeerId::random());
+            set.insert(PeerId::random());
+            set
+        };
+        let cid = Cid::default();
+        let mut query = GetQuery::new(cid, initial_set);
+
+        let first_peer = assert_query::wants_block(&mut query, &cid);
+        let second_peer = assert_query::wants_have(&mut query, &cid);
+
+        query.complete_request(second_peer.to_owned(), true);
+        assert_query::is_pending(&mut query);
+
+        query.complete_request(first_peer, false);
+        assert_query::wants_block_from(&mut query, &cid, &second_peer);
+
+        query.complete_request(second_peer.to_owned(), true);
+        assert_query::is_completed(&mut query, {
+            let mut set = FnvHashSet::default();
+            set.insert(second_peer);
+            set
+        });
     }
 }
