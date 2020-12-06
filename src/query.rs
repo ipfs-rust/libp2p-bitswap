@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gets_block_from_spare_if_first_request_fails_before_have_is_received() {
+    fn test_get_query_gets_from_spare_if_block_request_fails() {
         let cid = Cid::default();
         let mut query = GetQuery::new(cid, {
             let mut set = FnvHashSet::default();
@@ -675,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gets_block_from_spare_if_first_request_fails_after_have_is_received() {
+    fn test_get_query_gets_from_spare_if_block_request_fails_after_have_is_received() {
         let cid = Cid::default();
         let mut query = GetQuery::new(cid, {
             let mut set = FnvHashSet::default();
