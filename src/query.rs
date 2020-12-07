@@ -171,7 +171,7 @@ impl GetQuery {
             let peer = have_set.iter().cloned().next();
             if let Some(peer) = peer {
                 have_set.remove(&peer);
-                self.start_request(peer.to_owned());
+                self.start_request(peer);
             }
         }
     }
