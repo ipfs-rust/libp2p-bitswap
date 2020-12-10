@@ -227,12 +227,11 @@ pub struct MessageTooLarge(usize);
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use libipld::cid::RAW;
-    use libipld::multihash::{Code, MultihashCode};
+    use libipld::multihash::{Code, MultihashDigest};
 
     pub fn create_cid(bytes: &[u8]) -> Cid {
         let digest = Code::Blake3_256.digest(bytes);
-        Cid::new_v1(RAW, digest)
+        Cid::new_v1(0x55, digest)
     }
 
     #[test]

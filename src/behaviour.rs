@@ -12,7 +12,7 @@ use crate::query::{BitswapSync, Query, QueryEvent, QueryManager, QueryResult};
 use fnv::FnvHashMap;
 use futures::task::{Context, Poll};
 use libipld::cid::Cid;
-use libipld::multihash::MultihashCode;
+use libipld::multihash::MultihashDigest;
 use libipld::store::StoreParams;
 use libp2p::core::connection::{ConnectionId, ListenerId};
 use libp2p::core::{ConnectedPoint, Multiaddr, PeerId};
@@ -281,8 +281,11 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         event,
                     });
                 }
-                Poll::Ready(NetworkBehaviourAction::ReportObservedAddr { address }) => {
-                    return Poll::Ready(NetworkBehaviourAction::ReportObservedAddr { address });
+                Poll::Ready(NetworkBehaviourAction::ReportObservedAddr { address, score }) => {
+                    return Poll::Ready(NetworkBehaviourAction::ReportObservedAddr {
+                        address,
+                        score,
+                    });
                 }
                 Poll::Pending => return Poll::Pending,
             };
@@ -307,7 +310,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         } => {
                             let have = self.config.store.contains(&cid);
                             let response = BitswapResponse::Have(have);
-                            self.inner.send_response(channel, response);
+                            self.inner.send_response(channel, response).ok();
                         }
                         BitswapRequest {
                             ty: RequestType::Block,
@@ -318,7 +321,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             } else {
                                 BitswapResponse::Have(false)
                             };
-                            self.inner.send_response(channel, response);
+                            self.inner.send_response(channel, response).ok();
                         }
                     },
                     RequestResponseMessage::Response {
@@ -340,6 +343,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         }
                     },
                 },
+                RequestResponseEvent::ResponseSent { .. } => {}
                 RequestResponseEvent::OutboundFailure {
                     peer,
                     request_id,
@@ -386,6 +390,7 @@ mod tests {
     use super::*;
     use crate::query::QueryType;
     use async_std::task;
+    use fnv::FnvHashSet;
     use futures::prelude::*;
     use libipld::block::Block;
     use libipld::cbor::DagCborCodec;
@@ -511,7 +516,8 @@ mod tests {
         fn references(&self, cid: &Cid) -> Box<dyn Iterator<Item = Cid>> {
             if let Some(data) = self.0.get(cid) {
                 let block = Block::<DefaultParams>::new_unchecked(*cid, data);
-                if let Ok(refs) = block.references() {
+                let mut refs = FnvHashSet::default();
+                if block.references(&mut refs).is_ok() {
                     return Box::new(refs.into_iter());
                 }
             }
