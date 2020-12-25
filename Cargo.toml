@@ -14,7 +14,7 @@ futures = "0.3.8"
 libipld = { version = "0.9.0", default-features = false }
 libp2p = { version = "0.33.0", default-features = false, features = ["request-response"] }
 log = "0.4.11"
-thiserror = "1.0.22"
+thiserror = "1.0.23"
 unsigned-varint = { version = "0.5.1", features = ["futures", "std"] }
 
 [dev-dependencies]
@@ -23,3 +23,6 @@ env_logger = "0.8.2"
 libipld = { version = "0.9.0", default-features = false, features = ["dag-cbor"] }
 libp2p = "0.33.0"
 multihash = { version = "0.13.2", default-features = false, features = ["blake3"] }
+
+[patch.crates-io]
+libp2p = { path = "../rust-libp2p" }

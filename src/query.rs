@@ -4,16 +4,6 @@ use libipld::cid::Cid;
 use libipld::error::BlockNotFound;
 use libp2p::PeerId;
 use std::collections::VecDeque;
-use std::sync::Arc;
-
-/// Bitswap sync trait for customizing the syncing behaviour.
-pub trait BitswapSync: Send + Sync + 'static {
-    /// Returns the list of blocks that need to be synced.
-    fn references(&self, cid: &Cid) -> Box<dyn Iterator<Item = Cid>>;
-
-    /// Returns if a cid needs to be synced.
-    fn contains(&self, cid: &Cid) -> bool;
-}
 
 /// Query type.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -60,6 +50,8 @@ pub enum QueryEvent {
     Request(PeerId, Cid, RequestType),
     /// The query completed with a result.
     Complete(Query, QueryResult),
+    /// Missing blocks.
+    MissingBlocks(Cid),
 }
 
 impl std::fmt::Display for QueryEvent {
@@ -70,6 +62,7 @@ impl std::fmt::Display for QueryEvent {
             Self::GetProviders(cid) => write!(f, "providers {}", cid),
             Self::Complete(query, Ok(())) => write!(f, "{} ok", query),
             Self::Complete(query, Err(BlockNotFound(cid))) => write!(f, "{} err {}", query, cid),
+            Self::MissingBlocks(cid) => write!(f, "missing blocks {}", cid),
         }
     }
 }
@@ -145,9 +138,9 @@ impl GetQuery {
         } else {
             RequestType::Block
         };
-        self.requests.insert(peer.clone());
+        self.requests.insert(peer);
         if ty == RequestType::Block {
-            self.block_request = Some(peer.clone());
+            self.block_request = Some(peer);
         }
         self.events
             .push_back(GetQueryEvent::Request(peer, self.cid, ty))
@@ -216,17 +209,16 @@ impl GetQuery {
 #[derive(Debug)]
 enum SyncQueryEvent {
     Query(GetQuery),
+    MissingBlocks(Cid),
     Complete(QueryResult),
 }
 
 struct SyncQuery {
     cid: Cid,
-    syncer: Arc<dyn BitswapSync>,
-    requests: FnvHashSet<Cid>,
+    initial_set: FnvHashSet<PeerId>,
+    missing: FnvHashSet<Cid>,
+    not_missing: FnvHashSet<Cid>,
     events: VecDeque<SyncQueryEvent>,
-    visited: FnvHashSet<Cid>,
-    num_requests: usize,
-    num_calls_start_request: usize,
 }
 
 impl std::borrow::Borrow<Cid> for SyncQuery {
@@ -250,62 +242,56 @@ impl PartialEq for SyncQuery {
 impl Eq for SyncQuery {}
 
 impl SyncQuery {
-    pub fn new(cid: Cid, syncer: Arc<dyn BitswapSync>) -> Self {
+    pub fn new(cid: Cid, missing: FnvHashSet<Cid>) -> Self {
         let mut me = Self {
             cid,
-            syncer,
-            requests: Default::default(),
+            initial_set: Default::default(),
+            missing: Default::default(),
+            not_missing: Default::default(),
             events: Default::default(),
-            visited: Default::default(),
-            num_requests: 0,
-            num_calls_start_request: 0,
         };
-        me.start_request(&cid, Default::default());
+        me.add_missing(missing);
         me
     }
 
-    fn start_request(&mut self, cid: &Cid, initial_set: FnvHashSet<PeerId>) {
-        if self.visited.contains(cid) {
+    pub fn add_missing(&mut self, missing: FnvHashSet<Cid>) {
+        if missing.is_empty() {
+            self.events.push_back(SyncQueryEvent::Complete(Ok(())));
             return;
         }
-        self.num_calls_start_request += 1;
-        if self.syncer.contains(cid) {
-            self.visited.insert(*cid);
-            for cid in self.syncer.references(cid) {
-                self.start_request(&cid, initial_set.clone());
+        for cid in missing {
+            if !self.not_missing.contains(&cid) {
+                let req = GetQuery::new(cid, self.initial_set.clone());
+                self.events.push_back(SyncQueryEvent::Query(req));
+                self.missing.insert(cid);
             }
-        } else if self.requests.insert(*cid) {
-            let req = GetQuery::new(*cid, initial_set);
-            self.events.push_back(SyncQueryEvent::Query(req));
-            self.num_requests += 1;
         }
     }
 
     pub fn complete_request(&mut self, cid: &Cid, res: &Result<FnvHashSet<PeerId>, ()>) -> bool {
-        if self.requests.remove(&cid) {
-            match res {
-                Ok(initial_set) => {
-                    self.start_request(cid, initial_set.clone());
-                }
-                Err(()) => {
-                    self.events
-                        .push_back(SyncQueryEvent::Complete(Err(BlockNotFound(*cid))));
-                }
-            }
-            true
-        } else {
-            false
+        if !self.missing.remove(&cid) {
+            return false;
         }
+        match res {
+            Ok(initial_set) => {
+                for peer in initial_set {
+                    self.initial_set.insert(*peer);
+                }
+                self.not_missing.insert(*cid);
+                self.events
+                    .push_back(SyncQueryEvent::MissingBlocks(self.cid));
+            }
+            Err(()) => {
+                self.events
+                    .push_back(SyncQueryEvent::Complete(Err(BlockNotFound(*cid))));
+            }
+        }
+        true
     }
 
     pub fn next(&mut self) -> Option<SyncQueryEvent> {
         if let Some(event) = self.events.pop_front() {
             return Some(event);
-        }
-        if self.requests.is_empty() {
-            log::trace!("num requests {}", self.num_requests);
-            log::trace!("num calls {}", self.num_calls_start_request);
-            return Some(SyncQueryEvent::Complete(Ok(())));
         }
         None
     }
@@ -350,14 +336,14 @@ impl QueryManager {
         }
     }
 
-    pub fn sync(&mut self, cid: Cid, syncer: Arc<dyn BitswapSync>) {
+    pub fn sync(&mut self, cid: Cid, missing: FnvHashSet<Cid>) {
         if !self.sync.contains(&cid) {
             let query = Query {
                 ty: QueryType::Sync,
                 cid,
             };
             log::trace!("{}", query);
-            let sync = SyncQuery::new(cid, syncer);
+            let sync = SyncQuery::new(cid, missing);
             self.sync.insert(sync);
             self.progress.insert(query);
             self.user.insert(query);
@@ -371,7 +357,7 @@ impl QueryManager {
         };
         if self.user.remove(&query) {
             if let Some(sync) = self.sync.take(&cid) {
-                for cid in sync.requests {
+                for cid in sync.missing {
                     self._cancel_get(cid, false);
                 }
             }
@@ -408,6 +394,17 @@ impl QueryManager {
             self.get.insert(query);
             self.progress.insert(Query {
                 ty: QueryType::Get,
+                cid,
+            });
+        }
+    }
+
+    pub fn add_missing(&mut self, cid: Cid, missing: FnvHashSet<Cid>) {
+        if let Some(mut query) = self.sync.take(&cid) {
+            query.add_missing(missing);
+            self.sync.insert(query);
+            self.progress.insert(Query {
+                ty: QueryType::Sync,
                 cid,
             });
         }
@@ -490,6 +487,10 @@ impl QueryManager {
                                     self.get.insert(get);
                                     self.sync.insert(sync);
                                 }
+                                Some(SyncQueryEvent::MissingBlocks(cid)) => {
+                                    self.sync.insert(sync);
+                                    return Some(QueryEvent::MissingBlocks(cid));
+                                }
                                 Some(SyncQueryEvent::Complete(res)) => {
                                     let query = Query {
                                         ty: QueryType::Sync,
@@ -552,11 +553,11 @@ mod tests {
         ));
         for peer in initial_set {
             assert!(matches!(query.next(), None));
-            query.complete_request(peer.clone(), false);
+            query.complete_request(peer, false);
         }
         assert!(matches!(query.next(), Some(GetQueryEvent::GetProviders(_))));
         for provider in &provider_set {
-            query.add_provider(provider.clone());
+            query.add_provider(*provider);
         }
         query.complete_get_providers();
         assert!(matches!(
@@ -622,7 +623,7 @@ mod tests {
         assert!(matches!(query.next(), Some(GetQueryEvent::GetProviders(_))));
         assert!(matches!(query.next(), None));
         for provider in &provider_set {
-            query.add_provider(provider.clone());
+            query.add_provider(*provider);
         }
         query.complete_get_providers();
         assert!(matches!(
