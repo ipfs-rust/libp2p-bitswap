@@ -312,7 +312,7 @@ impl QueryManager {
                 ty: QueryType::Get,
                 cid,
             };
-            log::trace!("{}", query);
+            tracing::trace!("{}", query);
             let get = GetQuery::new(cid, Default::default());
             self.get.insert(get);
             self.progress.insert(query);
@@ -332,7 +332,7 @@ impl QueryManager {
         if self.user.remove(&query) == user {
             self.get.remove(&cid);
             self.progress.remove(&query);
-            log::trace!("cancel {}", query);
+            tracing::trace!("cancel {}", query);
         }
     }
 
@@ -342,7 +342,7 @@ impl QueryManager {
                 ty: QueryType::Sync,
                 cid,
             };
-            log::trace!("{}", query);
+            tracing::trace!("{}", query);
             let sync = SyncQuery::new(cid, missing);
             self.sync.insert(sync);
             self.progress.insert(query);
@@ -362,7 +362,7 @@ impl QueryManager {
                 }
             }
             self.progress.remove(&query);
-            log::trace!("cancel {}", query);
+            tracing::trace!("cancel {}", query);
         }
     }
 
@@ -438,13 +438,13 @@ impl QueryManager {
                             match get.next() {
                                 Some(GetQueryEvent::Request(peer_id, cid, ty)) => {
                                     let event = QueryEvent::Request(peer_id, cid, ty);
-                                    log::trace!("{}", event);
+                                    tracing::trace!("{}", event);
                                     self.get.insert(get);
                                     return Some(event);
                                 }
                                 Some(GetQueryEvent::GetProviders(cid)) => {
                                     let event = QueryEvent::GetProviders(cid);
-                                    log::trace!("{}", event);
+                                    tracing::trace!("{}", event);
                                     self.get.insert(get);
                                     return Some(event);
                                 }
@@ -456,7 +456,7 @@ impl QueryManager {
                                     };
                                     let query_res = res.map(|_| ()).map_err(|_| BlockNotFound(cid));
                                     let event = QueryEvent::Complete(query, query_res);
-                                    log::trace!("{}", event);
+                                    tracing::trace!("{}", event);
                                     if self.user.remove(&query) {
                                         return Some(event);
                                     }
@@ -482,7 +482,7 @@ impl QueryManager {
                                         ty: QueryType::Get,
                                         cid: get.cid,
                                     };
-                                    log::trace!("{}", query);
+                                    tracing::trace!("{}", query);
                                     self.progress.insert(query);
                                     self.get.insert(get);
                                     self.sync.insert(sync);
@@ -497,9 +497,9 @@ impl QueryManager {
                                         cid,
                                     };
                                     if res.is_ok() {
-                                        log::trace!("sync ok {}", cid);
+                                        tracing::trace!("sync ok {}", cid);
                                     } else {
-                                        log::trace!("sync err {}", cid);
+                                        tracing::trace!("sync err {}", cid);
                                     }
                                     if self.user.remove(&query) {
                                         return Some(QueryEvent::Complete(query, res));

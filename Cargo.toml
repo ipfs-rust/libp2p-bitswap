@@ -13,8 +13,9 @@ fnv = "1.0.7"
 futures = "0.3.8"
 libipld = { version = "0.9.0", default-features = false }
 libp2p = { version = "0.33.0", default-features = false, features = ["request-response"] }
-log = "0.4.11"
+prometheus = "0.11.0"
 thiserror = "1.0.23"
+tracing = "0.1.22"
 unsigned-varint = { version = "0.5.1", features = ["futures", "std"] }
 
 [dev-dependencies]
