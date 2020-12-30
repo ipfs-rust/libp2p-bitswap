@@ -1,6 +1,6 @@
 //! Bitswap protocol implementation
 #![deny(missing_docs)]
-//#![deny(warnings)]
+#![deny(warnings)]
 
 mod behaviour;
 mod protocol;
