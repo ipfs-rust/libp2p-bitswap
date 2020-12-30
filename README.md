@@ -22,55 +22,85 @@ The mechanism for locating providers can be abstracted. A dht can be plugged in 
 db query. The bitswap api looks as follows:
 
 ```rust
-pub enum Query {
-    Get(Cid),
-    Sync(Cid),
+#[derive(Debug)]
+pub enum BitswapEvent<P: StoreParams> {
+    /// A get query needs a list of providers to make progress. Once the new set of
+    /// providers is determined the get query can be notified using the `inject_providers`
+    /// method.
+    Providers(QueryId, Cid),
+    /// A sync query needs a list of missing blocks to make progress. Once the set of missing
+    /// blocks is determined the sync query can be notified using the `inject_missing_blocks`
+    /// method.
+    MissingBlocks(QueryId, Cid),
+    /// A peer has sent us a have request. The request can be answered using the `inject_have`
+    /// method.
+    Have(Channel, PeerId, Cid),
+    /// A peer has sent us a block request. The request can be answered using the `inject_block`
+    /// method.
+    Block(Channel, PeerId, Cid),
+    /// Received a block from a peer.
+    Received(QueryId, PeerId, Block<P>),
+    /// A get or sync query completed.
+    Complete(QueryId, Result<(), BlockNotFound>),
 }
 
-pub enum BitswapEvent {
-    GetProviders(Cid),
-    QueryComplete(Query, Result<()>),
+pub struct BitswapConfig {
+    /// Timeout of a request.
+    pub request_timeout: Duration,
+    /// Time a connection is kept alive.
+    pub connection_keep_alive: Duration,
+    /// The number of concurrent requests per peer.
+    pub receive_limit: NonZeroU16,
 }
 
-impl Bitswap {
-    pub fn add_address(&mut self, peer_id: &PeerId, addr: Multiaddr) { .. }
-    pub fn get(&mut self, cid: Cid) { .. }
-    pub fn cancel_get(&mut self, cid: Cid) { .. }
-    pub fn add_provider(&mut self, cid: Cid, peer_id: PeerId) { .. }
-    pub fn complete_get_providers(&mut self, cid: Cid) { .. }
-    pub fn poll(&mut self, cx: &mut Context) -> BitswapEvent { .. }
+impl<P: StoreParams> Bitswap<P> {
+    /// Creates a new `Bitswap` behaviour.
+    pub fn new(config: BitswapConfig) -> Self;
+
+    /// Adds an address for a peer.
+    pub fn add_address(&mut self, peer_id: &PeerId, addr: Multiaddr);
+
+    /// Starts a get query with an initial guess of providers.
+    pub fn get(&mut self, cid: Cid, initial: impl Iterator<Item = PeerId>) -> QueryId;
+
+    /// Starts a sync query with an the initial set of missing blocks.
+    pub fn sync(&mut self, cid: Cid, missing: impl Iterator<Item = Cid>) -> QueryId;
+
+    /// Cancels an in progress query. Returns true if a query was cancelled.
+    pub fn cancel(&mut self, id: QueryId) -> bool;
+
+    /// Adds a provider for a cid. Used for handling the `Providers` event.
+    pub fn inject_providers(&mut self, id: QueryId, providers: Vec<PeerId>);
+
+    /// Add missing blocks. Used for handling the `MissingBlocks` event.
+    pub fn inject_missing_blocks(&mut self, id: QueryId, missing: Vec<Cid>);
+
+    /// Send a have response. Used for handling the `Have` event.
+    pub fn inject_have(&mut self, channel: Channel, have: bool);
+
+    /// Send a block response. Used for handling the `Block` event.
+    pub fn inject_block(&mut self, channel: Channel, block: Option<Vec<u8>>);
+
+    /// Returns bitswap stats.
+    pub fn stats(&self) -> &BitswapStats;
+
+    /// Polls the behaviour for the next bitswap event.
+    pub fn poll(&mut self, cx: &mut Context) -> BitswapEvent;
 }
 ```
 
 So what happens when you create a get request? First all the providers in the initial set
 are queried with the have request. As an optimization, in every batch of queries a block
 request is sent instead. If the get query finds a block it returns a query complete. If the
-block wasn't found in the initial set, a `GetProviders(Cid)` event is emitted. This is where
-the bitswap consumer tries to locate providers by for example performing a dht lookup. These
-providers are registered by calling the `add_provider` method. After the locating of providers
-completes, it is signaled by calling `complete_get_providers`. The query manager then performs
-bitswap requests using the new provider set which results in the block being found or a block
-not found error.
+block wasn't found in the initial set, a `Providers` event is emitted. This is where
+the bitswap consumer tries to locate providers by for example performing a dht lookup. After
+the locating of providers completes, it is signaled by calling `inject_providers`. The query
+manager then performs bitswap requests using the new provider set which results in the block
+being found or a `BlockNotFound` error.
 
 Often we want to sync an entire dag of blocks. We can efficiently sync dags of blocks by adding
 a sync query that runs get queries in parallel for all the references of a block. The set of
-providers that had a block is used as the initial set in a reference query. For this we extend
-our api with the following calls.
-
-```rust
-/// Bitswap sync trait for customizing the syncing behaviour.
-pub trait BitswapSync {
-    /// Returns the list of blocks that need to be synced.
-    fn references(&self, cid: &Cid) -> Box<dyn Iterator<Item = Cid>>;
-    /// Returns if a cid needs to be synced.
-    fn contains(&self, cid: &Cid) -> bool;
-}
-
-impl Bitswap {
-    pub fn sync(&mut self, cid: Cid, syncer: Arc<dyn BitswapSync>) { .. }
-    pub fn cancel_sync(&mut self, cid: Cid) { .. }
-}
-```
+providers that had a block is used as the initial set in a reference query.
 
 ## License
 MIT OR Apache-2.0

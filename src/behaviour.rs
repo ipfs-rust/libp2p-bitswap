@@ -36,20 +36,24 @@ pub type Channel = ResponseChannel<BitswapResponse>;
 /// Event emitted by the bitswap behaviour.
 #[derive(Debug)]
 pub enum BitswapEvent<P: StoreParams> {
-    /// The sync algorithm wants to know the providers of a block. To handle
-    /// this event use the `add_provider(cid, peer_id)` and `complete_get_providers(cid)`
-    /// methods.
+    /// A get query needs a list of providers to make progress. Once the new set of
+    /// providers is determined the get query can be notified using the `inject_providers`
+    /// method.
     Providers(QueryId, Cid),
-    /// Missing blocks.
+    /// A sync query needs a list of missing blocks to make progress. Once the set of missing
+    /// blocks is determined the sync query can be notified using the `inject_missing_blocks`
+    /// method.
     MissingBlocks(QueryId, Cid),
-    /// Received block.
-    ReceivedBlock(QueryId, PeerId, Block<P>),
+    /// A peer has sent us a have request. The request can be answered using the `inject_have`
+    /// method.
+    Have(Channel, PeerId, Cid),
+    /// A peer has sent us a block request. The request can be answered using the `inject_block`
+    /// method.
+    Block(Channel, PeerId, Cid),
+    /// Received a block from a peer.
+    Received(QueryId, PeerId, Block<P>),
     /// A get or sync query completed.
     Complete(QueryId, Result<(), BlockNotFound>),
-    /// Have request.
-    HaveBlock(Channel, PeerId, Cid),
-    /// Want request.
-    WantBlock(Channel, PeerId, Cid),
 }
 
 /// Bitswap configuration.
@@ -116,19 +120,19 @@ impl<P: StoreParams> Bitswap<P> {
         self.inner.add_address(peer_id, addr);
     }
 
-    /// Starts a get query.
+    /// Starts a get query with an initial guess of providers.
     pub fn get(&mut self, cid: Cid, initial: impl Iterator<Item = PeerId>) -> QueryId {
         self.stats.num_get.inc();
         self.query_manager.get(None, cid, initial)
     }
 
-    /// Starts a sync query.
+    /// Starts a sync query with an the initial set of missing blocks.
     pub fn sync(&mut self, cid: Cid, missing: impl Iterator<Item = Cid>) -> QueryId {
         self.stats.num_sync.inc();
         self.query_manager.sync(cid, missing)
     }
 
-    /// Cancels an in progress query.
+    /// Cancels an in progress query. Returns true if a query was cancelled.
     pub fn cancel(&mut self, id: QueryId) -> bool {
         match self.query_manager.cancel(id) {
             Some(QueryType::Get) => {
@@ -143,20 +147,20 @@ impl<P: StoreParams> Bitswap<P> {
         }
     }
 
-    /// Adds a provider for a cid. Used for handling the `GetProviders` event.
+    /// Adds a provider for a cid. Used for handling the `Providers` event.
     pub fn inject_providers(&mut self, id: QueryId, providers: Vec<PeerId>) {
         self.query_manager
             .inject_response(id, Response::Providers(providers));
     }
 
-    /// Add missing blocks.
+    /// Add missing blocks. Used for handling the `MissingBlocks` event.
     pub fn inject_missing_blocks(&mut self, id: QueryId, missing: Vec<Cid>) {
         self.query_manager
             .inject_response(id, Response::MissingBlocks(missing));
     }
 
-    /// Send have block.
-    pub fn send_have(&mut self, channel: Channel, have: bool) {
+    /// Send a have response. Used for handling the `Have` event.
+    pub fn inject_have(&mut self, channel: Channel, have: bool) {
         if have {
             self.stats.num_tx_have_yes.inc();
         } else {
@@ -167,8 +171,8 @@ impl<P: StoreParams> Bitswap<P> {
         self.inner.send_response(channel, response).ok();
     }
 
-    /// Send block.
-    pub fn send_block(&mut self, channel: Channel, block: Option<Vec<u8>>) {
+    /// Send a block response. Used for handling the `Block` event.
+    pub fn inject_block(&mut self, channel: Channel, block: Option<Vec<u8>>) {
         let response = if let Some(data) = block {
             self.stats.num_tx_block_count.inc();
             self.stats.num_tx_block_bytes.inc_by(data.len() as u64);
@@ -396,7 +400,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             cid,
                         } => {
                             self.stats.num_rx_have.inc();
-                            let event = BitswapEvent::HaveBlock(channel, peer, cid);
+                            let event = BitswapEvent::Have(channel, peer, cid);
                             return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                         }
                         BitswapRequest {
@@ -404,7 +408,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             cid,
                         } => {
                             self.stats.num_rx_block.inc();
-                            let event = BitswapEvent::WantBlock(channel, peer, cid);
+                            let event = BitswapEvent::Block(channel, peer, cid);
                             return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                         }
                     },
@@ -436,7 +440,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                 self.stats.num_rx_block_bytes.inc_by(len as u64);
                                 self.query_manager
                                     .inject_response(id, Response::Block(peer, true));
-                                let event = BitswapEvent::ReceivedBlock(root, peer, block);
+                                let event = BitswapEvent::Received(root, peer, block);
                                 return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                             } else {
                                 self.stats.num_rx_block_count_invalid.inc();
@@ -599,12 +603,12 @@ mod tests {
             task::spawn(async move {
                 loop {
                     match self.swarm.next().await {
-                        BitswapEvent::HaveBlock(channel, _peer_id, cid) => {
-                            self.swarm.send_have(channel, self.store.contains_key(&cid))
+                        BitswapEvent::Have(channel, _peer_id, cid) => {
+                            self.swarm.inject_have(channel, self.store.contains_key(&cid))
                         }
-                        BitswapEvent::WantBlock(channel, _peer_id, cid) => {
+                        BitswapEvent::Block(channel, _peer_id, cid) => {
                             let data = self.store.get(&cid).cloned();
-                            self.swarm.send_block(channel, data);
+                            self.swarm.inject_block(channel, data);
                         }
                         e => tracing::debug!("{}: {:?}", name, e),
                     }
@@ -633,7 +637,7 @@ mod tests {
     }
 
     fn assert_block(event: BitswapEvent<DefaultParams>, id: QueryId, block: &Block<DefaultParams>) {
-        if let BitswapEvent::ReceivedBlock(id2, _peer, block2) = event {
+        if let BitswapEvent::Received(id2, _peer, block2) = event {
             assert_eq!(id2, id);
             assert_eq!(&block2, block);
         } else {
