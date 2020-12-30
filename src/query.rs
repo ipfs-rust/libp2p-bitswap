@@ -132,6 +132,7 @@ pub struct QueryManager {
 }
 
 impl QueryManager {
+    /// Start a new subquery.
     fn start_query(
         &mut self,
         root: QueryId,
@@ -156,22 +157,28 @@ impl QueryManager {
         id
     }
 
+    /// Starts a new have query to ask a peer if it has a block.
     fn have(&mut self, root: QueryId, parent: QueryId, peer_id: PeerId, cid: Cid) -> QueryId {
         self.start_query(root, Some(parent), cid, Request::Have(peer_id, cid))
     }
 
+    /// Starts a new block query to request a block from a peer.
     fn block(&mut self, root: QueryId, parent: QueryId, peer_id: PeerId, cid: Cid) -> QueryId {
         self.start_query(root, Some(parent), cid, Request::Block(peer_id, cid))
     }
 
+    /// Starts a query to determine the providers of a block.
     fn providers(&mut self, root: QueryId, parent: QueryId, cid: Cid) -> QueryId {
         self.start_query(root, Some(parent), cid, Request::Providers(cid))
     }
 
+    /// Starts a query to determine the missing blocks of a dag.
     fn missing_blocks(&mut self, parent: QueryId, cid: Cid) -> QueryId {
         self.start_query(parent, Some(parent), cid, Request::MissingBlocks(cid))
     }
 
+    /// Starts a query to locate and retrieve a block. The initial peers will be queried first
+    /// before performing a more expensive provider query.
     pub fn get(
         &mut self,
         parent: Option<QueryId>,
@@ -207,6 +214,8 @@ impl QueryManager {
         id
     }
 
+    /// Starts a query to recursively retrieve a dag. The missing blocks are the first
+    /// blocks that need to be retrieved.
     pub fn sync(&mut self, cid: Cid, missing: impl Iterator<Item = Cid>) -> QueryId {
         let id = QueryId(self.id_counter);
         self.id_counter += 1;
@@ -233,6 +242,7 @@ impl QueryManager {
         id
     }
 
+    /// Cancels an in progress query.
     pub fn cancel(&mut self, root: QueryId) -> Option<QueryType> {
         let query = self.queries.remove(&root)?;
         let queries = &self.queries;
@@ -267,6 +277,7 @@ impl QueryManager {
         }
     }
 
+    /// Advances a get query state machine using a transition function.
     fn get_query<F>(&mut self, id: QueryId, f: F)
     where
         F: FnOnce(&mut Self, &Header, GetState) -> Transition<GetState, Vec<PeerId>>,
@@ -294,6 +305,7 @@ impl QueryManager {
         }
     }
 
+    /// Advances a sync query state machine using a transition function.
     fn sync_query<F>(&mut self, id: QueryId, f: F)
     where
         F: FnOnce(&mut Self, &Header, SyncState) -> Transition<SyncState, Result<(), Cid>>,
@@ -321,6 +333,12 @@ impl QueryManager {
         }
     }
 
+    /// Processes the response of a have query.
+    ///
+    /// Marks the in progress query as complete and updates the set of peers that have
+    /// a block. If there isn't an in progress block query a new block query will be
+    /// started. If no block query can be started either a provider query is started or
+    /// the get query is marked as complete with a block-not-found error.
     fn recv_have(&mut self, query: Header, peer_id: PeerId, have: bool) {
         self.get_query(query.parent.unwrap(), |mgr, parent, mut state| {
             state.have.remove(&query.id);
@@ -345,6 +363,9 @@ impl QueryManager {
         });
     }
 
+    /// Processes the response of a block query.
+    ///
+    /// Either completes the get query or processes it like a have query response.
     fn recv_block(&mut self, query: Header, peer_id: PeerId, block: bool) {
         if block {
             self.get_query(query.parent.unwrap(), |_mgr, _parent, mut state| {
@@ -356,6 +377,10 @@ impl QueryManager {
         }
     }
 
+    /// Processes the response of a providers query.
+    ///
+    /// Either starts a new set of block and have queries or marks the get query
+    /// as complete with a `block-not-found` error if no new providers where found.
     fn recv_providers(&mut self, query: Header, peers: Vec<PeerId>) {
         self.get_query(query.parent.unwrap(), |mgr, parent, mut state| {
             state.initial = false;
@@ -376,6 +401,10 @@ impl QueryManager {
         });
     }
 
+    /// Processes the response of a missing blocks query.
+    ///
+    /// Starts a get query for each missing block. If there are no in progress queries
+    /// the sync query is marked as complete.
     fn recv_missing_blocks(&mut self, query: Header, missing: Vec<Cid>) {
         self.sync_query(query.parent.unwrap(), |mgr, parent, mut state| {
             let providers = state.children.remove(&query.id).unwrap_or_default();
@@ -392,6 +421,10 @@ impl QueryManager {
         });
     }
 
+    /// Processes the response of a get query.
+    ///
+    /// If it is part of a sync query a new missing blocks query is started. Otherwise
+    /// the get query emits a `complete` event.
     fn recv_get(&mut self, query: Header, providers: Vec<PeerId>) {
         if let Some(id) = query.parent {
             self.sync_query(id, |mgr, parent, mut state| {
@@ -416,11 +449,15 @@ impl QueryManager {
         }
     }
 
+    /// Processes the response of a sync query.
+    ///
+    /// The sync query emits a `complete` event.
     fn recv_sync(&mut self, query: Header, res: Result<(), Cid>) {
         self.events
             .push_back(QueryEvent::Complete(query.id, QueryType::Sync, res));
     }
 
+    /// Dispatches the response to a query handler.
     pub fn inject_response(&mut self, id: QueryId, res: Response) {
         let query = if let Some(query) = self.queries.remove(&id) {
             query.hdr
@@ -444,10 +481,12 @@ impl QueryManager {
         }
     }
 
+    /// Returns the header of a query.
     pub fn query_info(&self, id: QueryId) -> Option<&Header> {
         self.queries.get(&id).map(|q| &q.hdr)
     }
 
+    /// Retrieves the next query event.
     pub fn next(&mut self) -> Option<QueryEvent> {
         self.events.pop_front()
     }
