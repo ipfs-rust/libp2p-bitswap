@@ -17,7 +17,7 @@ pub struct BitswapProtocol;
 
 impl ProtocolName for BitswapProtocol {
     fn protocol_name(&self) -> &[u8] {
-        b"/substrate/bitswap/1.0.0"
+        b"/ipfs-embed/bitswap/1.0.0"
     }
 }
 
