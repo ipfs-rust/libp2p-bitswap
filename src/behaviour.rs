@@ -120,6 +120,11 @@ impl<P: StoreParams> Bitswap<P> {
         self.inner.add_address(peer_id, addr);
     }
 
+    /// Removes an address for a peer.
+    pub fn remove_address(&mut self, peer_id: &PeerId, addr: &Multiaddr) {
+        self.inner.remove_address(peer_id, addr);
+    }
+
     /// Starts a get query with an initial guess of providers.
     pub fn get(&mut self, cid: Cid, initial: impl Iterator<Item = PeerId>) -> QueryId {
         self.stats.num_get.inc();
