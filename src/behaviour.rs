@@ -8,14 +8,13 @@
 use crate::protocol::{
     BitswapCodec, BitswapProtocol, BitswapRequest, BitswapResponse, RequestType,
 };
-use crate::query::{QueryEvent, QueryId, QueryManager, QueryType, Request, Response};
-use crate::stats::BitswapStats;
+use crate::query::{QueryEvent, QueryId, QueryManager, Request, Response};
+use crate::stats::*;
 use fnv::FnvHashMap;
 use futures::task::{Context, Poll};
-use libipld::block::Block;
-use libipld::cid::Cid;
 use libipld::error::BlockNotFound;
 use libipld::store::StoreParams;
+use libipld::{Block, Cid, Result};
 use libp2p::core::connection::{ConnectionId, ListenerId};
 use libp2p::core::{ConnectedPoint, Multiaddr, PeerId};
 use libp2p::request_response::{
@@ -25,6 +24,7 @@ use libp2p::request_response::{
 };
 use libp2p::swarm::ProtocolsHandler;
 use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters};
+use prometheus::Registry;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::num::NonZeroU16;
@@ -93,8 +93,6 @@ pub struct Bitswap<P: StoreParams> {
     pending_requests: VecDeque<(QueryId, PeerId, BitswapRequest)>,
     /// Requests.
     requests: FnvHashMap<RequestId, QueryId>,
-    /// Stats.
-    stats: BitswapStats,
 }
 
 impl<P: StoreParams> Bitswap<P> {
@@ -111,7 +109,6 @@ impl<P: StoreParams> Bitswap<P> {
             query_manager: Default::default(),
             pending_requests: Default::default(),
             requests: Default::default(),
-            stats: Default::default(),
         }
     }
 
@@ -127,39 +124,33 @@ impl<P: StoreParams> Bitswap<P> {
 
     /// Starts a get query with an initial guess of providers.
     pub fn get(&mut self, cid: Cid, initial: impl Iterator<Item = PeerId>) -> QueryId {
-        self.stats.num_get.inc();
         self.query_manager.get(None, cid, initial)
     }
 
     /// Starts a sync query with an the initial set of missing blocks.
     pub fn sync(&mut self, cid: Cid, missing: impl Iterator<Item = Cid>) -> QueryId {
-        self.stats.num_sync.inc();
         self.query_manager.sync(cid, missing)
     }
 
     /// Cancels an in progress query. Returns true if a query was cancelled.
     pub fn cancel(&mut self, id: QueryId) -> bool {
-        match self.query_manager.cancel(id) {
-            Some(QueryType::Get) => {
-                self.stats.num_get_cancel.inc();
-                true
-            }
-            Some(QueryType::Sync) => {
-                self.stats.num_sync_cancel.inc();
-                true
-            }
-            None => false,
+        let res = self.query_manager.cancel(id);
+        if res {
+            REQUESTS_CANCELED.inc();
         }
+        res
     }
 
     /// Adds a provider for a cid. Used for handling the `Providers` event.
     pub fn inject_providers(&mut self, id: QueryId, providers: Vec<PeerId>) {
+        PROVIDERS_TOTAL.inc_by(providers.len() as u64);
         self.query_manager
             .inject_response(id, Response::Providers(providers));
     }
 
     /// Add missing blocks. Used for handling the `MissingBlocks` event.
     pub fn inject_missing_blocks(&mut self, id: QueryId, missing: Vec<Cid>) {
+        MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
         self.query_manager
             .inject_response(id, Response::MissingBlocks(missing));
     }
@@ -167,9 +158,9 @@ impl<P: StoreParams> Bitswap<P> {
     /// Send a have response. Used for handling the `Have` event.
     pub fn inject_have(&mut self, channel: Channel, have: bool) {
         if have {
-            self.stats.num_tx_have_yes.inc();
+            RESPONSES_TOTAL.with_label_values(&["have"]).inc();
         } else {
-            self.stats.num_tx_have_no.inc();
+            RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
         }
         let response = BitswapResponse::Have(have);
         tracing::trace!("have {}", have);
@@ -179,21 +170,35 @@ impl<P: StoreParams> Bitswap<P> {
     /// Send a block response. Used for handling the `Block` event.
     pub fn inject_block(&mut self, channel: Channel, block: Option<Vec<u8>>) {
         let response = if let Some(data) = block {
-            self.stats.num_tx_block_count.inc();
-            self.stats.num_tx_block_bytes.inc_by(data.len() as u64);
+            RESPONSES_TOTAL.with_label_values(&["block"]).inc();
+            SENT_BLOCK_BYTES.inc_by(data.len() as u64);
             tracing::trace!("block {}", data.len());
             BitswapResponse::Block(data)
         } else {
-            self.stats.num_tx_have_no.inc();
+            RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
             tracing::trace!("have false");
             BitswapResponse::Have(false)
         };
         self.inner.send_response(channel, response).unwrap();
     }
 
-    /// Returns bitswap stats.
-    pub fn stats(&self) -> &BitswapStats {
-        &self.stats
+    /// Registers prometheus metrics.
+    pub fn register_metrics(&self, registry: &Registry) -> Result<()> {
+        registry.register(Box::new(REQUESTS_TOTAL.clone()))?;
+        registry.register(Box::new(REQUEST_DURATION_SECONDS.clone()))?;
+        registry.register(Box::new(REQUESTS_CANCELED.clone()))?;
+        registry.register(Box::new(BLOCK_NOT_FOUND.clone()))?;
+        registry.register(Box::new(PROVIDERS_TOTAL.clone()))?;
+        registry.register(Box::new(MISSING_BLOCKS_TOTAL.clone()))?;
+        registry.register(Box::new(RECEIVED_BLOCK_BYTES.clone()))?;
+        registry.register(Box::new(RECEIVED_INVALID_BLOCK_BYTES.clone()))?;
+        registry.register(Box::new(SENT_BLOCK_BYTES.clone()))?;
+        registry.register(Box::new(RESPONSES_TOTAL.clone()))?;
+        registry.register(Box::new(THROTTLED_INBOUND.clone()))?;
+        registry.register(Box::new(THROTTLED_OUTBOUND.clone()))?;
+        registry.register(Box::new(OUTBOUND_FAILURE.clone()))?;
+        registry.register(Box::new(INBOUND_FAILURE.clone()))?;
+        Ok(())
     }
 }
 
@@ -292,7 +297,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             match query {
                 QueryEvent::Request(id, req) => match req {
                     Request::Have(peer_id, cid) => {
-                        self.stats.num_tx_have.inc();
                         let req = BitswapRequest {
                             ty: RequestType::Have,
                             cid,
@@ -300,7 +304,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         self.pending_requests.push_back((id, peer_id, req));
                     }
                     Request::Block(peer_id, cid) => {
-                        self.stats.num_tx_block.inc();
                         let req = BitswapRequest {
                             ty: RequestType::Block,
                             cid,
@@ -308,33 +311,18 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         self.pending_requests.push_back((id, peer_id, req));
                     }
                     Request::Providers(cid) => {
-                        self.stats.num_get_providers.inc();
                         let event = BitswapEvent::Providers(id, cid);
                         return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                     }
                     Request::MissingBlocks(cid) => {
-                        self.stats.num_missing_blocks.inc();
                         let event = BitswapEvent::MissingBlocks(id, cid);
                         return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                     }
                 },
-                QueryEvent::Complete(id, ty, res) => {
-                    match ty {
-                        QueryType::Get => {
-                            if res.is_ok() {
-                                self.stats.num_get_ok.inc();
-                            } else {
-                                self.stats.num_get_err.inc();
-                            }
-                        }
-                        QueryType::Sync => {
-                            if res.is_ok() {
-                                self.stats.num_get_ok.inc();
-                            } else {
-                                self.stats.num_sync_err.inc();
-                            }
-                        }
-                    };
+                QueryEvent::Complete(id, res) => {
+                    if res.is_err() {
+                        BLOCK_NOT_FOUND.inc();
+                    }
                     let event = BitswapEvent::Complete(id, res.map_err(BlockNotFound));
                     return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                 }
@@ -383,12 +371,12 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             let event = match event {
                 ThrottledEvent::Event(event) => event,
                 ThrottledEvent::ResumeSending(peer_id) => {
-                    self.stats.num_throttled_resume_send.inc();
+                    THROTTLED_OUTBOUND.inc();
                     tracing::trace!("resume sending {}", peer_id);
                     continue;
                 }
                 ThrottledEvent::TooManyInboundRequests(peer_id) => {
-                    self.stats.num_throttled_too_many_inbound.inc();
+                    THROTTLED_INBOUND.inc();
                     tracing::trace!("too many inbound requests from {}", peer_id);
                     continue;
                 }
@@ -404,7 +392,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             ty: RequestType::Have,
                             cid,
                         } => {
-                            self.stats.num_rx_have.inc();
                             let event = BitswapEvent::Have(channel, peer, cid);
                             return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                         }
@@ -412,7 +399,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             ty: RequestType::Block,
                             cid,
                         } => {
-                            self.stats.num_rx_block.inc();
                             let event = BitswapEvent::Block(channel, peer, cid);
                             return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                         }
@@ -422,11 +408,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         response,
                     } => match response {
                         BitswapResponse::Have(have) => {
-                            if have {
-                                self.stats.num_rx_have_yes.inc();
-                            } else {
-                                self.stats.num_rx_have_no.inc();
-                            }
                             let id = self.requests.remove(&request_id).unwrap();
                             self.query_manager
                                 .inject_response(id, Response::Have(peer, have));
@@ -441,15 +422,13 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             };
                             let len = data.len();
                             if let Ok(block) = Block::new(*cid, data) {
-                                self.stats.num_rx_block_count.inc();
-                                self.stats.num_rx_block_bytes.inc_by(len as u64);
+                                RECEIVED_BLOCK_BYTES.inc_by(len as u64);
                                 self.query_manager
                                     .inject_response(id, Response::Block(peer, true));
                                 let event = BitswapEvent::Received(root, peer, block);
                                 return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                             } else {
-                                self.stats.num_rx_block_count_invalid.inc();
-                                self.stats.num_rx_block_bytes_invalid.inc_by(len as u64);
+                                RECEIVED_INVALID_BLOCK_BYTES.inc_by(len as u64);
                                 self.query_manager
                                     .inject_response(id, Response::Block(peer, false));
                             }
@@ -474,16 +453,20 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     }
                     match error {
                         OutboundFailure::DialFailure => {
-                            self.stats.num_outbound_dial_failure.inc();
+                            OUTBOUND_FAILURE.with_label_values(&["dial_failure"]).inc();
                         }
                         OutboundFailure::Timeout => {
-                            self.stats.num_outbound_timeout.inc();
+                            OUTBOUND_FAILURE.with_label_values(&["timeout"]).inc();
                         }
                         OutboundFailure::ConnectionClosed => {
-                            self.stats.num_outbound_connection_closed.inc();
+                            OUTBOUND_FAILURE
+                                .with_label_values(&["connection_closed"])
+                                .inc();
                         }
                         OutboundFailure::UnsupportedProtocols => {
-                            self.stats.num_outbound_unsupported_protocols.inc();
+                            OUTBOUND_FAILURE
+                                .with_label_values(&["unsupported_protocols"])
+                                .inc();
                         }
                     }
                 }
@@ -500,16 +483,22 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     );
                     match error {
                         InboundFailure::Timeout => {
-                            self.stats.num_inbound_timeout.inc();
+                            INBOUND_FAILURE.with_label_values(&["timeout"]).inc();
                         }
                         InboundFailure::ConnectionClosed => {
-                            self.stats.num_inbound_connection_closed.inc();
+                            INBOUND_FAILURE
+                                .with_label_values(&["connection_closed"])
+                                .inc();
                         }
                         InboundFailure::UnsupportedProtocols => {
-                            self.stats.num_inbound_unsupported_protocols.inc();
+                            INBOUND_FAILURE
+                                .with_label_values(&["unsupported_protocols"])
+                                .inc();
                         }
                         InboundFailure::ResponseOmission => {
-                            self.stats.num_inbound_response_omission.inc();
+                            INBOUND_FAILURE
+                                .with_label_values(&["response_omission"])
+                                .inc();
                         }
                     }
                 }
@@ -608,9 +597,9 @@ mod tests {
             task::spawn(async move {
                 loop {
                     match self.swarm.next().await {
-                        BitswapEvent::Have(channel, _peer_id, cid) => {
-                            self.swarm.inject_have(channel, self.store.contains_key(&cid))
-                        }
+                        BitswapEvent::Have(channel, _peer_id, cid) => self
+                            .swarm
+                            .inject_have(channel, self.store.contains_key(&cid)),
                         BitswapEvent::Block(channel, _peer_id, cid) => {
                             let data = self.store.get(&cid).cloned();
                             self.swarm.inject_block(channel, data);

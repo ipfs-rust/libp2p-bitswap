@@ -1,6 +1,8 @@
+use crate::stats::{REQUESTS_TOTAL, REQUEST_DURATION_SECONDS};
 use fnv::{FnvHashMap, FnvHashSet};
 use libipld::cid::Cid;
 use libp2p::PeerId;
+use prometheus::HistogramTimer;
 use std::collections::VecDeque;
 
 /// Query id.
@@ -11,13 +13,6 @@ impl std::fmt::Display for QueryId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         self.0.fmt(f)
     }
-}
-
-/// Query type.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueryType {
-    Get,
-    Sync,
 }
 
 /// Request.
@@ -74,10 +69,10 @@ pub enum QueryEvent {
     /// A subquery to run.
     Request(QueryId, Request),
     /// Complete event.
-    Complete(QueryId, QueryType, Result<(), Cid>),
+    Complete(QueryId, Result<(), Cid>),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct Header {
     /// Query id.
     pub id: QueryId,
@@ -87,6 +82,16 @@ pub struct Header {
     pub parent: Option<QueryId>,
     /// Cid.
     pub cid: Cid,
+    /// Timer.
+    pub timer: HistogramTimer,
+    /// Type.
+    pub label: &'static str,
+}
+
+impl Drop for Header {
+    fn drop(&mut self) {
+        REQUESTS_TOTAL.with_label_values(&[self.label]).inc();
+    }
 }
 
 /// Query.
@@ -139,7 +144,11 @@ impl QueryManager {
         parent: Option<QueryId>,
         cid: Cid,
         req: Request,
+        label: &'static str,
     ) -> QueryId {
+        let timer = REQUEST_DURATION_SECONDS
+            .with_label_values(&[label])
+            .start_timer();
         let id = QueryId(self.id_counter);
         self.id_counter += 1;
         let query = Query {
@@ -148,6 +157,8 @@ impl QueryManager {
                 root,
                 parent,
                 cid,
+                timer,
+                label,
             },
             state: State::None,
         };
@@ -159,22 +170,40 @@ impl QueryManager {
 
     /// Starts a new have query to ask a peer if it has a block.
     fn have(&mut self, root: QueryId, parent: QueryId, peer_id: PeerId, cid: Cid) -> QueryId {
-        self.start_query(root, Some(parent), cid, Request::Have(peer_id, cid))
+        self.start_query(root, Some(parent), cid, Request::Have(peer_id, cid), "have")
     }
 
     /// Starts a new block query to request a block from a peer.
     fn block(&mut self, root: QueryId, parent: QueryId, peer_id: PeerId, cid: Cid) -> QueryId {
-        self.start_query(root, Some(parent), cid, Request::Block(peer_id, cid))
+        self.start_query(
+            root,
+            Some(parent),
+            cid,
+            Request::Block(peer_id, cid),
+            "block",
+        )
     }
 
     /// Starts a query to determine the providers of a block.
     fn providers(&mut self, root: QueryId, parent: QueryId, cid: Cid) -> QueryId {
-        self.start_query(root, Some(parent), cid, Request::Providers(cid))
+        self.start_query(
+            root,
+            Some(parent),
+            cid,
+            Request::Providers(cid),
+            "providers",
+        )
     }
 
     /// Starts a query to determine the missing blocks of a dag.
     fn missing_blocks(&mut self, parent: QueryId, cid: Cid) -> QueryId {
-        self.start_query(parent, Some(parent), cid, Request::MissingBlocks(cid))
+        self.start_query(
+            parent,
+            Some(parent),
+            cid,
+            Request::MissingBlocks(cid),
+            "missing-blocks",
+        )
     }
 
     /// Starts a query to locate and retrieve a block. The initial peers will be queried first
@@ -185,6 +214,9 @@ impl QueryManager {
         cid: Cid,
         initial: impl Iterator<Item = PeerId>,
     ) -> QueryId {
+        let timer = REQUEST_DURATION_SECONDS
+            .with_label_values(&["get"])
+            .start_timer();
         let id = QueryId(self.id_counter);
         self.id_counter += 1;
         let root = parent.unwrap_or(id);
@@ -207,6 +239,8 @@ impl QueryManager {
                 root,
                 parent,
                 cid,
+                timer,
+                label: "get",
             },
             state: State::Get(state),
         };
@@ -217,6 +251,9 @@ impl QueryManager {
     /// Starts a query to recursively retrieve a dag. The missing blocks are the first
     /// blocks that need to be retrieved.
     pub fn sync(&mut self, cid: Cid, missing: impl Iterator<Item = Cid>) -> QueryId {
+        let timer = REQUEST_DURATION_SECONDS
+            .with_label_values(&["sync"])
+            .start_timer();
         let id = QueryId(self.id_counter);
         self.id_counter += 1;
         tracing::trace!("{} {} sync", id, id);
@@ -235,6 +272,8 @@ impl QueryManager {
                 root: id,
                 parent: None,
                 cid,
+                timer,
+                label: "sync",
             },
             state: State::Sync(state),
         };
@@ -243,13 +282,17 @@ impl QueryManager {
     }
 
     /// Cancels an in progress query.
-    pub fn cancel(&mut self, root: QueryId) -> Option<QueryType> {
-        let query = self.queries.remove(&root)?;
+    pub fn cancel(&mut self, root: QueryId) -> bool {
+        let query = if let Some(query) = self.queries.remove(&root) {
+            query
+        } else {
+            return false;
+        };
         let queries = &self.queries;
         self.events.retain(|event| {
             let (id, req) = match event {
                 QueryEvent::Request(id, req) => (id, req),
-                QueryEvent::Complete(_, _, _) => return true,
+                QueryEvent::Complete(_, _) => return true,
             };
             if queries.get(id).map(|q| q.hdr.root) != Some(root) {
                 return true;
@@ -260,7 +303,7 @@ impl QueryManager {
         match query.state {
             State::Get(_) => {
                 tracing::trace!("{} {} get cancel", root, root);
-                Some(QueryType::Get)
+                true
             }
             State::Sync(state) => {
                 for id in state.missing {
@@ -268,11 +311,11 @@ impl QueryManager {
                     self.queries.remove(&id);
                 }
                 tracing::trace!("{} {} sync cancel", root, root);
-                Some(QueryType::Sync)
+                true
             }
             State::None => {
                 self.queries.insert(root, query);
-                None
+                false
             }
         }
     }
@@ -444,8 +487,7 @@ impl QueryManager {
             } else {
                 Ok(())
             };
-            self.events
-                .push_back(QueryEvent::Complete(query.id, QueryType::Get, res));
+            self.events.push_back(QueryEvent::Complete(query.id, res));
         }
     }
 
@@ -453,8 +495,7 @@ impl QueryManager {
     ///
     /// The sync query emits a `complete` event.
     fn recv_sync(&mut self, query: Header, res: Result<(), Cid>) {
-        self.events
-            .push_back(QueryEvent::Complete(query.id, QueryType::Sync, res));
+        self.events.push_back(QueryEvent::Complete(query.id, res));
     }
 
     /// Dispatches the response to a query handler.
@@ -513,15 +554,9 @@ mod tests {
         }
     }
 
-    fn assert_complete(
-        event: Option<QueryEvent>,
-        id: QueryId,
-        ty: QueryType,
-        res: Result<(), Cid>,
-    ) {
-        if let Some(QueryEvent::Complete(id2, ty2, res2)) = event {
+    fn assert_complete(event: Option<QueryEvent>, id: QueryId, res: Result<(), Cid>) {
+        if let Some(QueryEvent::Complete(id2, res2)) = event {
             assert_eq!(id, id2);
-            assert_eq!(ty, ty2);
             assert_eq!(res, res2);
         } else {
             panic!("{:?} is not a complete event", event);
@@ -556,7 +591,7 @@ mod tests {
         mgr.inject_response(id2, Response::Have(provider_set[1], false));
         mgr.inject_response(id3, Response::Have(provider_set[2], false));
 
-        assert_complete(mgr.next(), id, QueryType::Get, Err(cid));
+        assert_complete(mgr.next(), id, Err(cid));
     }
 
     #[test]
@@ -575,7 +610,7 @@ mod tests {
         mgr.inject_response(id2, Response::Have(initial_set[1], false));
         mgr.inject_response(id3, Response::Have(initial_set[2], false));
 
-        assert_complete(mgr.next(), id, QueryType::Get, Ok(()));
+        assert_complete(mgr.next(), id, Ok(()));
     }
 
     #[test]
@@ -606,7 +641,7 @@ mod tests {
         mgr.inject_response(id2, Response::Have(provider_set[1], false));
         mgr.inject_response(id3, Response::Have(provider_set[2], false));
 
-        assert_complete(mgr.next(), id, QueryType::Get, Ok(()));
+        assert_complete(mgr.next(), id, Ok(()));
     }
 
     #[test]
@@ -628,7 +663,7 @@ mod tests {
         let id1 = assert_request(mgr.next(), Request::Block(initial_set[1], cid));
         mgr.inject_response(id1, Response::Block(initial_set[1], true));
 
-        assert_complete(mgr.next(), id, QueryType::Get, Ok(()));
+        assert_complete(mgr.next(), id, Ok(()));
     }
 
     #[test]
@@ -653,6 +688,6 @@ mod tests {
         let id1 = assert_request(mgr.next(), Request::Block(initial_set[2], cid));
         mgr.inject_response(id1, Response::Block(initial_set[2], true));
 
-        assert_complete(mgr.next(), id, QueryType::Get, Ok(()));
+        assert_complete(mgr.next(), id, Ok(()));
     }
 }

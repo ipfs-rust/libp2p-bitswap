@@ -9,4 +9,3 @@ mod stats;
 
 pub use crate::behaviour::{Bitswap, BitswapConfig, BitswapEvent, Channel};
 pub use crate::query::QueryId;
-pub use crate::stats::BitswapStats;

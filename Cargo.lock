@@ -1252,6 +1252,7 @@ dependencies = [
  "env_logger",
  "fnv",
  "futures",
+ "lazy_static",
  "libipld",
  "libp2p",
  "multihash",
