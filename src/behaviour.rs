@@ -654,9 +654,8 @@ mod tests {
             let peer_id = self.peer_id;
             task::spawn(async move {
                 loop {
-                    match self.swarm.next().await {
-                        e => tracing::debug!("{}: {:?}", name, e),
-                    }
+                    let event = self.swarm.next().await;
+                    tracing::debug!("{}: {:?}", name, event);
                 }
             });
             peer_id

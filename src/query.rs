@@ -223,8 +223,10 @@ impl QueryManager {
         self.id_counter += 1;
         let root = parent.unwrap_or(id);
         tracing::trace!("{} {} get", root, id);
-        let mut state = GetState::default();
-        state.initial = true;
+        let mut state = GetState {
+            initial: true,
+            ..Default::default()
+        };
         for peer in initial {
             if state.block.is_none() {
                 state.block = Some(self.block(root, id, peer, cid));
