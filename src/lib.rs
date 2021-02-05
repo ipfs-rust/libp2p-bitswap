@@ -5,6 +5,7 @@
 mod behaviour;
 mod protocol;
 mod query;
+mod stats;
 
-pub use crate::behaviour::{Bitswap, BitswapConfig, BitswapEvent, BitswapStore};
-pub use crate::query::{BitswapSync, Query, QueryResult, QueryType};
+pub use crate::behaviour::{Bitswap, BitswapConfig, BitswapEvent, BitswapStore, Channel};
+pub use crate::query::QueryId;

@@ -8,52 +8,62 @@
 use crate::protocol::{
     BitswapCodec, BitswapProtocol, BitswapRequest, BitswapResponse, RequestType,
 };
-use crate::query::{BitswapSync, Query, QueryEvent, QueryManager, QueryResult};
+use crate::query::{QueryEvent, QueryId, QueryManager, Request, Response};
+use crate::stats::*;
 use fnv::FnvHashMap;
 use futures::task::{Context, Poll};
-use libipld::cid::Cid;
-use libipld::multihash::MultihashDigest;
+use libipld::error::BlockNotFound;
 use libipld::store::StoreParams;
+use libipld::{Block, Cid, Result};
 use libp2p::core::connection::{ConnectionId, ListenerId};
 use libp2p::core::{ConnectedPoint, Multiaddr, PeerId};
 use libp2p::request_response::{
-    throttled::Event as ThrottledEvent, ProtocolSupport, RequestId, RequestResponseConfig,
-    RequestResponseEvent, RequestResponseMessage, Throttled,
+    throttled::{Event as ThrottledEvent, ResponseChannel, Throttled},
+    InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponseConfig,
+    RequestResponseEvent, RequestResponseMessage,
 };
 use libp2p::swarm::ProtocolsHandler;
 use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters};
+use prometheus::Registry;
 use std::collections::VecDeque;
-use std::convert::TryFrom;
 use std::error::Error;
 use std::num::NonZeroU16;
-use std::sync::Arc;
 use std::time::Duration;
 
-/// Bitswap store abstraction.
-pub trait BitswapStore<P: StoreParams>: Send + Sync + 'static {
-    /// Does the store contain a cid. Used for replying to have requests.
-    fn contains(&self, cid: &Cid) -> bool;
-    /// The data matching a cid. Used for replying to block requests.
-    fn get(&self, cid: &Cid) -> Option<Vec<u8>>;
-    /// Insert a block into the store. Used when receiving a block response.
-    fn insert(&self, cid: Cid, data: Vec<u8>);
-}
+/// Bitswap response channel.
+pub type Channel = ResponseChannel<BitswapResponse>;
 
 /// Event emitted by the bitswap behaviour.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum BitswapEvent {
-    /// The sync algorithm wants to know the providers of a block. To handle
-    /// this event use the `add_provider(cid, peer_id)` and `complete_get_providers(cid)`
-    /// methods.
-    GetProviders(Cid),
+    /// A get query needs a list of providers to make progress. Once the new set of
+    /// providers is determined the get query can be notified using the `inject_providers`
+    /// method.
+    Providers(QueryId, Cid),
+    /// Received a block from a peer. Includes the number of known missing blocks for a
+    /// sync query. When a block is received and missing blocks is not empty the counter
+    /// is increased. If missing blocks is empty the counter is decremented.
+    Progress(QueryId, usize),
     /// A get or sync query completed.
-    QueryComplete(Query, QueryResult),
+    Complete(QueryId, Result<()>),
+}
+
+/// Trait implemented by a block store.
+pub trait BitswapStore: Send + Sync + 'static {
+    /// The store params.
+    type Params: StoreParams;
+    /// A have query needs to know if the block store contains the block.
+    fn contains(&mut self, cid: &Cid) -> Result<bool>;
+    /// A block query needs to retrieve the block from the store.
+    fn get(&mut self, cid: &Cid) -> Result<Option<Vec<u8>>>;
+    /// A block response needs to insert the block into the store.
+    fn insert(&mut self, block: &Block<Self::Params>) -> Result<()>;
+    /// A sync query needs a list of missing blocks to make progress.
+    fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>>;
 }
 
 /// Bitswap configuration.
-pub struct BitswapConfig<P: StoreParams> {
-    /// The bitswap store.
-    pub store: Box<dyn BitswapStore<P>>,
+pub struct BitswapConfig {
     /// Timeout of a request.
     pub request_timeout: Duration,
     /// Time a connection is kept alive.
@@ -62,35 +72,40 @@ pub struct BitswapConfig<P: StoreParams> {
     pub receive_limit: NonZeroU16,
 }
 
-impl<P: StoreParams> BitswapConfig<P> {
+impl BitswapConfig {
     /// Creates a new `BitswapConfig`.
-    pub fn new<S: BitswapStore<P>>(store: S) -> Self {
+    pub fn new() -> Self {
         Self {
-            store: Box::new(store),
-            request_timeout: Duration::from_secs(3),
+            request_timeout: Duration::from_secs(10),
             connection_keep_alive: Duration::from_secs(10),
             receive_limit: NonZeroU16::new(20).expect("20 > 0"),
         }
     }
 }
 
+impl Default for BitswapConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Network behaviour that handles sending and receiving blocks.
 pub struct Bitswap<P: StoreParams> {
-    /// Bitswap config.
-    config: BitswapConfig<P>,
     /// Inner behaviour.
     inner: Throttled<BitswapCodec<P>>,
     /// Query manager.
     query_manager: QueryManager,
     /// Pending requests.
-    pending_requests: VecDeque<(PeerId, BitswapRequest)>,
+    pending_requests: VecDeque<(QueryId, PeerId, BitswapRequest)>,
     /// Requests.
-    requests: FnvHashMap<RequestId, Cid>,
+    requests: FnvHashMap<RequestId, QueryId>,
+    /// Bitswap store.
+    store: Box<dyn BitswapStore<Params = P>>,
 }
 
 impl<P: StoreParams> Bitswap<P> {
     /// Creates a new `Bitswap` behaviour.
-    pub fn new(config: BitswapConfig<P>) -> Self {
+    pub fn new<S: BitswapStore<Params = P>>(config: BitswapConfig, store: S) -> Self {
         let mut rr_config = RequestResponseConfig::default();
         rr_config.set_connection_keep_alive(config.connection_keep_alive);
         rr_config.set_request_timeout(config.request_timeout);
@@ -98,11 +113,11 @@ impl<P: StoreParams> Bitswap<P> {
         let mut inner = Throttled::new(BitswapCodec::<P>::default(), protocols, rr_config);
         inner.set_receive_limit(config.receive_limit);
         Self {
-            config,
             inner,
             query_manager: Default::default(),
             pending_requests: Default::default(),
             requests: Default::default(),
+            store: Box::new(store),
         }
     }
 
@@ -111,34 +126,88 @@ impl<P: StoreParams> Bitswap<P> {
         self.inner.add_address(peer_id, addr);
     }
 
-    /// Starts a get query.
-    pub fn get(&mut self, cid: Cid) {
-        self.query_manager.get(cid);
+    /// Removes an address for a peer.
+    pub fn remove_address(&mut self, peer_id: &PeerId, addr: &Multiaddr) {
+        self.inner.remove_address(peer_id, addr);
     }
 
-    /// Cancels an in progress get query.
-    pub fn cancel_get(&mut self, cid: Cid) {
-        self.query_manager.cancel_get(cid);
+    /// Starts a get query with an initial guess of providers.
+    pub fn get(&mut self, cid: Cid, initial: impl Iterator<Item = PeerId>) -> QueryId {
+        self.query_manager.get(None, cid, initial)
     }
 
-    /// Starts a sync query.
-    pub fn sync(&mut self, cid: Cid, syncer: Arc<dyn BitswapSync>) {
-        self.query_manager.sync(cid, syncer);
+    /// Starts a sync query with an the initial set of missing blocks.
+    pub fn sync(&mut self, cid: Cid, missing: impl Iterator<Item = Cid>) -> QueryId {
+        self.query_manager.sync(cid, missing)
     }
 
-    /// Cancels an in progress sync query.
-    pub fn cancel_sync(&mut self, cid: Cid) {
-        self.query_manager.cancel_sync(cid);
+    /// Cancels an in progress query. Returns true if a query was cancelled.
+    pub fn cancel(&mut self, id: QueryId) -> bool {
+        let res = self.query_manager.cancel(id);
+        if res {
+            REQUESTS_CANCELED.inc();
+        }
+        res
     }
 
-    /// Adds a provider for a cid. Used for handling the `GetProviders` event.
-    pub fn add_provider(&mut self, cid: Cid, peer_id: PeerId) {
-        self.query_manager.add_provider(cid, peer_id);
+    /// Adds a provider for a cid. Used for handling the `Providers` event.
+    pub fn inject_providers(&mut self, id: QueryId, providers: Vec<PeerId>) {
+        PROVIDERS_TOTAL.inc_by(providers.len() as u64);
+        self.query_manager
+            .inject_response(id, Response::Providers(providers));
     }
 
-    /// All providers where added. Used for handling the `GetProviders` event.
-    pub fn complete_get_providers(&mut self, cid: Cid) {
-        self.query_manager.complete_get_providers(cid);
+    /// Add missing blocks. Used for handling the `MissingBlocks` event.
+    fn inject_missing_blocks(&mut self, id: QueryId, missing: Vec<Cid>) {
+        MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
+        self.query_manager
+            .inject_response(id, Response::MissingBlocks(missing));
+    }
+
+    /// Send a have response. Used for handling the `Have` event.
+    fn inject_have(&mut self, channel: Channel, have: bool) {
+        if have {
+            RESPONSES_TOTAL.with_label_values(&["have"]).inc();
+        } else {
+            RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
+        }
+        let response = BitswapResponse::Have(have);
+        tracing::trace!("have {}", have);
+        self.inner.send_response(channel, response).ok();
+    }
+
+    /// Send a block response. Used for handling the `Block` event.
+    fn inject_block(&mut self, channel: Channel, block: Option<Vec<u8>>) {
+        let response = if let Some(data) = block {
+            RESPONSES_TOTAL.with_label_values(&["block"]).inc();
+            SENT_BLOCK_BYTES.inc_by(data.len() as u64);
+            tracing::trace!("block {}", data.len());
+            BitswapResponse::Block(data)
+        } else {
+            RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
+            tracing::trace!("have false");
+            BitswapResponse::Have(false)
+        };
+        self.inner.send_response(channel, response).unwrap();
+    }
+
+    /// Registers prometheus metrics.
+    pub fn register_metrics(&self, registry: &Registry) -> Result<()> {
+        registry.register(Box::new(REQUESTS_TOTAL.clone()))?;
+        registry.register(Box::new(REQUEST_DURATION_SECONDS.clone()))?;
+        registry.register(Box::new(REQUESTS_CANCELED.clone()))?;
+        registry.register(Box::new(BLOCK_NOT_FOUND.clone()))?;
+        registry.register(Box::new(PROVIDERS_TOTAL.clone()))?;
+        registry.register(Box::new(MISSING_BLOCKS_TOTAL.clone()))?;
+        registry.register(Box::new(RECEIVED_BLOCK_BYTES.clone()))?;
+        registry.register(Box::new(RECEIVED_INVALID_BLOCK_BYTES.clone()))?;
+        registry.register(Box::new(SENT_BLOCK_BYTES.clone()))?;
+        registry.register(Box::new(RESPONSES_TOTAL.clone()))?;
+        registry.register(Box::new(THROTTLED_INBOUND.clone()))?;
+        registry.register(Box::new(THROTTLED_OUTBOUND.clone()))?;
+        registry.register(Box::new(OUTBOUND_FAILURE.clone()))?;
+        registry.register(Box::new(INBOUND_FAILURE.clone()))?;
+        Ok(())
     }
 }
 
@@ -235,33 +304,61 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     > {
         while let Some(query) = self.query_manager.next() {
             match query {
-                QueryEvent::Request(peer, cid, ty) => {
-                    let request = BitswapRequest { ty, cid };
-                    self.pending_requests.push_back((peer, request));
-                }
-                QueryEvent::GetProviders(cid) => {
-                    let event = BitswapEvent::GetProviders(cid);
+                QueryEvent::Request(id, req) => match req {
+                    Request::Have(peer_id, cid) => {
+                        let req = BitswapRequest {
+                            ty: RequestType::Have,
+                            cid,
+                        };
+                        self.pending_requests.push_back((id, peer_id, req));
+                    }
+                    Request::Block(peer_id, cid) => {
+                        let req = BitswapRequest {
+                            ty: RequestType::Block,
+                            cid,
+                        };
+                        self.pending_requests.push_back((id, peer_id, req));
+                    }
+                    Request::Providers(cid) => {
+                        let event = BitswapEvent::Providers(id, cid);
+                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                    }
+                    Request::MissingBlocks(cid) => match self.store.missing_blocks(&cid) {
+                        Ok(blocks) => self.inject_missing_blocks(id, blocks),
+                        Err(err) => {
+                            self.query_manager.cancel(id);
+                            let event = BitswapEvent::Complete(id, Err(err));
+                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                        }
+                    },
+                },
+                QueryEvent::Progress(id, missing) => {
+                    let event = BitswapEvent::Progress(id, missing);
                     return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                 }
-                QueryEvent::Complete(query, res) => {
-                    let event = BitswapEvent::QueryComplete(query, res);
+                QueryEvent::Complete(id, res) => {
+                    if res.is_err() {
+                        BLOCK_NOT_FOUND.inc();
+                    }
+                    let event =
+                        BitswapEvent::Complete(id, res.map_err(|cid| BlockNotFound(cid).into()));
                     return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                }
-            }
-        }
-        for _ in 0..self.pending_requests.len() {
-            if let Some((peer, request)) = self.pending_requests.pop_front() {
-                match self.inner.send_request(&peer, request) {
-                    Ok(id) => {
-                        self.requests.insert(id, request.cid);
-                    }
-                    Err(request) => {
-                        self.pending_requests.push_back((peer, request));
-                    }
                 }
             }
         }
         loop {
+            for _ in 0..self.pending_requests.len() {
+                if let Some((qid, peer, request)) = self.pending_requests.pop_front() {
+                    match self.inner.send_request(&peer, request) {
+                        Ok(rid) => {
+                            self.requests.insert(rid, qid);
+                        }
+                        Err(request) => {
+                            self.pending_requests.push_back((qid, peer, request));
+                        }
+                    }
+                }
+            }
             let event = match self.inner.poll(cx, pp) {
                 Poll::Ready(NetworkBehaviourAction::GenerateEvent(event)) => event,
                 Poll::Ready(NetworkBehaviourAction::DialAddress { address }) => {
@@ -291,9 +388,14 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             };
             let event = match event {
                 ThrottledEvent::Event(event) => event,
-                ThrottledEvent::ResumeSending(_peer_id) => continue,
+                ThrottledEvent::ResumeSending(peer_id) => {
+                    THROTTLED_OUTBOUND.inc();
+                    tracing::trace!("resume sending {}", peer_id);
+                    continue;
+                }
                 ThrottledEvent::TooManyInboundRequests(peer_id) => {
-                    log::info!("too many inbound requests from {}", peer_id);
+                    THROTTLED_INBOUND.inc();
+                    tracing::trace!("too many inbound requests from {}", peer_id);
                     continue;
                 }
             };
@@ -308,20 +410,15 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             ty: RequestType::Have,
                             cid,
                         } => {
-                            let have = self.config.store.contains(&cid);
-                            let response = BitswapResponse::Have(have);
-                            self.inner.send_response(channel, response).ok();
+                            let have = self.store.contains(&cid).ok().unwrap_or_default();
+                            self.inject_have(channel, have);
                         }
                         BitswapRequest {
                             ty: RequestType::Block,
                             cid,
                         } => {
-                            let response = if let Some(data) = self.config.store.get(&cid) {
-                                BitswapResponse::Block(data)
-                            } else {
-                                BitswapResponse::Have(false)
-                            };
-                            self.inner.send_response(channel, response).ok();
+                            let block = self.store.get(&cid).ok().unwrap_or_default();
+                            self.inject_block(channel, block);
                         }
                     },
                     RequestResponseMessage::Response {
@@ -329,16 +426,34 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         response,
                     } => match response {
                         BitswapResponse::Have(have) => {
-                            let cid = self.requests.remove(&request_id).unwrap();
-                            self.query_manager.complete_request(cid, peer, have);
+                            let id = self.requests.remove(&request_id).unwrap();
+                            self.query_manager
+                                .inject_response(id, Response::Have(peer, have));
                         }
                         BitswapResponse::Block(data) => {
-                            let cid = self.requests.remove(&request_id).unwrap();
-                            if verify_cid::<P>(&cid, &data) {
-                                self.config.store.insert(cid, data);
-                                self.query_manager.complete_request(cid, peer, true);
+                            let id = self.requests.remove(&request_id).unwrap();
+                            let cid = if let Some(info) = self.query_manager.query_info(id) {
+                                &info.cid
                             } else {
-                                self.query_manager.complete_request(cid, peer, false);
+                                continue;
+                            };
+                            let len = data.len();
+                            if let Ok(block) = Block::new(*cid, data) {
+                                RECEIVED_BLOCK_BYTES.inc_by(len as u64);
+                                if let Err(err) = self.store.insert(&block) {
+                                    self.query_manager.cancel(id);
+                                    let event = BitswapEvent::Complete(id, Err(err));
+                                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(
+                                        event,
+                                    ));
+                                } else {
+                                    self.query_manager
+                                        .inject_response(id, Response::Block(peer, true));
+                                }
+                            } else {
+                                RECEIVED_INVALID_BLOCK_BYTES.inc_by(len as u64);
+                                self.query_manager
+                                    .inject_response(id, Response::Block(peer, false));
                             }
                         }
                     },
@@ -349,14 +464,33 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     request_id,
                     error,
                 } => {
-                    log::error!(
+                    tracing::trace!(
                         "bitswap outbound failure {} {} {:?}",
                         peer,
                         request_id,
                         error
                     );
-                    if let Some(cid) = self.requests.remove(&request_id) {
-                        self.query_manager.complete_request(cid, peer, false);
+                    if let Some(id) = self.requests.remove(&request_id) {
+                        self.query_manager
+                            .inject_response(id, Response::Have(peer, false));
+                    }
+                    match error {
+                        OutboundFailure::DialFailure => {
+                            OUTBOUND_FAILURE.with_label_values(&["dial_failure"]).inc();
+                        }
+                        OutboundFailure::Timeout => {
+                            OUTBOUND_FAILURE.with_label_values(&["timeout"]).inc();
+                        }
+                        OutboundFailure::ConnectionClosed => {
+                            OUTBOUND_FAILURE
+                                .with_label_values(&["connection_closed"])
+                                .inc();
+                        }
+                        OutboundFailure::UnsupportedProtocols => {
+                            OUTBOUND_FAILURE
+                                .with_label_values(&["unsupported_protocols"])
+                                .inc();
+                        }
                     }
                 }
                 RequestResponseEvent::InboundFailure {
@@ -364,33 +498,42 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     request_id,
                     error,
                 } => {
-                    log::error!(
+                    tracing::trace!(
                         "bitswap inbound failure {} {} {:?}",
                         peer,
                         request_id,
                         error
                     );
+                    match error {
+                        InboundFailure::Timeout => {
+                            INBOUND_FAILURE.with_label_values(&["timeout"]).inc();
+                        }
+                        InboundFailure::ConnectionClosed => {
+                            INBOUND_FAILURE
+                                .with_label_values(&["connection_closed"])
+                                .inc();
+                        }
+                        InboundFailure::UnsupportedProtocols => {
+                            INBOUND_FAILURE
+                                .with_label_values(&["unsupported_protocols"])
+                                .inc();
+                        }
+                        InboundFailure::ResponseOmission => {
+                            INBOUND_FAILURE
+                                .with_label_values(&["response_omission"])
+                                .inc();
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-fn verify_cid<P: StoreParams>(cid: &Cid, data: &[u8]) -> bool {
-    if let Ok(code) = P::Hashes::try_from(cid.hash().code()) {
-        if code.digest(&data).digest() == cid.hash().digest() {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::QueryType;
     use async_std::task;
-    use fnv::FnvHashSet;
     use futures::prelude::*;
     use libipld::block::Block;
     use libipld::cbor::DagCborCodec;
@@ -406,9 +549,15 @@ mod tests {
     use libp2p::tcp::TcpConfig;
     use libp2p::yamux::YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
-    use std::marker::PhantomData;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    fn tracing_try_init() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init()
+            .ok();
+    }
 
     fn mk_transport() -> (PeerId, Boxed<(PeerId, StreamMuxerBox)>) {
         let id_key = identity::Keypair::generate_ed25519();
@@ -433,49 +582,50 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct Store<P: StoreParams> {
-        marker: PhantomData<P>,
-        inner: Arc<Mutex<FnvHashMap<Cid, Vec<u8>>>>,
-    }
+    struct Store(Arc<Mutex<FnvHashMap<Cid, Vec<u8>>>>);
 
-    impl<P: StoreParams> Store<P> {
-        fn new() -> Self {
-            Self {
-                marker: PhantomData,
-                inner: Default::default(),
+    impl BitswapStore for Store {
+        type Params = DefaultParams;
+        fn contains(&mut self, cid: &Cid) -> Result<bool> {
+            Ok(self.0.lock().unwrap().contains_key(cid))
+        }
+        fn get(&mut self, cid: &Cid) -> Result<Option<Vec<u8>>> {
+            Ok(self.0.lock().unwrap().get(cid).cloned())
+        }
+        fn insert(&mut self, block: &Block<Self::Params>) -> Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(*block.cid(), block.data().to_vec());
+            Ok(())
+        }
+        fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>> {
+            if let Some(data) = self.get(cid)? {
+                let block = Block::<Self::Params>::new_unchecked(*cid, data);
+                let mut refs = vec![];
+                block.references(&mut refs)?;
+                Ok(refs)
+            } else {
+                panic!("missing_blocks called before insert");
             }
-        }
-    }
-
-    impl<P: StoreParams> BitswapStore<P> for Store<P> {
-        fn contains(&self, cid: &Cid) -> bool {
-            self.inner.lock().unwrap().contains_key(cid)
-        }
-
-        fn get(&self, cid: &Cid) -> Option<Vec<u8>> {
-            self.inner.lock().unwrap().get(cid).cloned()
-        }
-
-        fn insert(&self, cid: Cid, data: Vec<u8>) {
-            self.inner.lock().unwrap().insert(cid, data);
         }
     }
 
     struct Peer {
         peer_id: PeerId,
         addr: Multiaddr,
-        store: Store<DefaultParams>,
+        store: Store,
         swarm: Swarm<Bitswap<DefaultParams>>,
     }
 
     impl Peer {
         fn new() -> Self {
             let (peer_id, trans) = mk_transport();
-            let store = Store::new();
+            let store = Store::default();
             let mut swarm = Swarm::new(
                 trans,
-                Bitswap::new(BitswapConfig::new(store.clone())),
-                peer_id.clone(),
+                Bitswap::new(BitswapConfig::new(), store.clone()),
+                peer_id,
             );
             Swarm::listen_on(&mut swarm, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
             while swarm.next().now_or_never().is_some() {}
@@ -492,8 +642,8 @@ mod tests {
             self.swarm.add_address(&peer.peer_id, peer.addr.clone());
         }
 
-        fn store(&self) -> &Store<DefaultParams> {
-            &self.store
+        fn store(&mut self) -> impl std::ops::DerefMut<Target = FnvHashMap<Cid, Vec<u8>>> + '_ {
+            self.store.0.lock().unwrap()
         }
 
         fn swarm(&mut self) -> &mut Swarm<Bitswap<DefaultParams>> {
@@ -501,38 +651,47 @@ mod tests {
         }
 
         fn spawn(mut self, name: &'static str) -> PeerId {
-            let peer_id = self.peer_id.clone();
+            let peer_id = self.peer_id;
             task::spawn(async move {
-                let e = self.swarm.next().await;
-                log::debug!("{}: {:?}", name, e);
+                loop {
+                    let event = self.swarm.next().await;
+                    tracing::debug!("{}: {:?}", name, event);
+                }
             });
             peer_id
         }
     }
 
-    struct Syncer<P: StoreParams>(Store<P>);
-
-    impl<P: StoreParams> BitswapSync for Syncer<P> {
-        fn references(&self, cid: &Cid) -> Box<dyn Iterator<Item = Cid>> {
-            if let Some(data) = self.0.get(cid) {
-                let block = Block::<DefaultParams>::new_unchecked(*cid, data);
-                let mut refs = FnvHashSet::default();
-                if block.references(&mut refs).is_ok() {
-                    return Box::new(refs.into_iter());
-                }
-            }
-            Box::new(std::iter::empty())
+    fn assert_providers(event: BitswapEvent, cid: Cid) -> QueryId {
+        if let BitswapEvent::Providers(id, cid2) = event {
+            assert_eq!(cid2, cid);
+            id
+        } else {
+            panic!("{:?} is not a provider request", event);
         }
+    }
 
-        fn contains(&self, cid: &Cid) -> bool {
-            self.0.contains(cid)
+    fn assert_progress(event: BitswapEvent, id: QueryId, missing: usize) {
+        if let BitswapEvent::Progress(id2, missing2) = event {
+            assert_eq!(id2, id);
+            assert_eq!(missing2, missing);
+        } else {
+            panic!("{:?} is not a progress event", event);
+        }
+    }
+
+    fn assert_complete_ok(event: BitswapEvent, id: QueryId) {
+        if let BitswapEvent::Complete(id2, Ok(())) = event {
+            assert_eq!(id2, id);
+        } else {
+            panic!("{:?} is not a complete event", event);
         }
     }
 
     #[async_std::test]
     async fn test_bitswap_get() {
-        env_logger::try_init().ok();
-        let peer1 = Peer::new();
+        tracing_try_init();
+        let mut peer1 = Peer::new();
         let mut peer2 = Peer::new();
         peer2.add_address(&peer1);
 
@@ -540,30 +699,18 @@ mod tests {
         peer1.store().insert(*block.cid(), block.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        peer2.swarm().get(*block.cid());
-        assert!(matches!(
-            peer2.swarm().next().await,
-            BitswapEvent::GetProviders(_)
-        ));
-        peer2.swarm().add_provider(*block.cid(), peer1);
-        peer2.swarm().complete_get_providers(*block.cid());
-        assert!(matches!(
-            peer2.swarm().next().await,
-            BitswapEvent::QueryComplete(
-                Query {
-                    ty: QueryType::Get,
-                    cid: _,
-                },
-                Ok(()),
-            )
-        ));
-        assert_eq!(peer2.store().get(block.cid()), Some(block.data().to_vec()));
+        let id = peer2.swarm().get(*block.cid(), std::iter::empty());
+
+        let id1 = assert_providers(peer2.swarm().next().await, *block.cid());
+        peer2.swarm().inject_providers(id1, vec![peer1]);
+
+        assert_complete_ok(peer2.swarm().next().await, id);
     }
 
     #[async_std::test]
     async fn test_bitswap_cancel_get() {
-        env_logger::try_init().ok();
-        let peer1 = Peer::new();
+        tracing_try_init();
+        let mut peer1 = Peer::new();
         let mut peer2 = Peer::new();
         peer2.add_address(&peer1);
 
@@ -571,15 +718,17 @@ mod tests {
         peer1.store().insert(*block.cid(), block.data().to_vec());
         peer1.spawn("peer1");
 
-        peer2.swarm().get(*block.cid());
-        peer2.swarm().cancel_get(*block.cid());
-        assert!(peer2.swarm().next().now_or_never().is_none());
+        let id = peer2.swarm().get(*block.cid(), std::iter::empty());
+        peer2.swarm().cancel(id);
+        let res = peer2.swarm().next().now_or_never();
+        println!("{:?}", res);
+        assert!(res.is_none());
     }
 
     #[async_std::test]
     async fn test_bitswap_sync() {
-        env_logger::try_init().ok();
-        let peer1 = Peer::new();
+        tracing_try_init();
+        let mut peer1 = Peer::new();
         let mut peer2 = Peer::new();
         peer2.add_address(&peer1);
 
@@ -599,34 +748,21 @@ mod tests {
         peer1.store().insert(*b2.cid(), b2.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let syncer = Arc::new(Syncer(peer2.store().clone()));
-        peer2.swarm().sync(*b2.cid(), syncer);
-        assert!(matches!(
-            peer2.swarm().next().await,
-            BitswapEvent::GetProviders(cid) if &cid == b2.cid()
-        ));
-        peer2.swarm().add_provider(*b2.cid(), peer1.clone());
-        peer2.swarm().complete_get_providers(*b2.cid());
+        let id = peer2.swarm().sync(*b2.cid(), std::iter::once(*b2.cid()));
 
-        assert!(matches!(
-            peer2.swarm().next().await,
-            BitswapEvent::QueryComplete(
-                Query {
-                    ty: QueryType::Sync,
-                    cid: _,
-                },
-                Ok(()),
-            )
-        ));
-        assert_eq!(peer2.store().get(b0.cid()), Some(b0.data().to_vec()));
-        assert_eq!(peer2.store().get(b1.cid()), Some(b1.data().to_vec()));
-        assert_eq!(peer2.store().get(b2.cid()), Some(b2.data().to_vec()));
+        let id1 = assert_providers(peer2.swarm().next().await, *b2.cid());
+        peer2.swarm().inject_providers(id1, vec![peer1]);
+
+        assert_progress(peer2.swarm().next().await, id, 1);
+        assert_progress(peer2.swarm().next().await, id, 1);
+
+        assert_complete_ok(peer2.swarm().next().await, id);
     }
 
     #[async_std::test]
     async fn test_bitswap_cancel_sync() {
-        env_logger::try_init().ok();
-        let peer1 = Peer::new();
+        tracing_try_init();
+        let mut peer1 = Peer::new();
         let mut peer2 = Peer::new();
         peer2.add_address(&peer1);
 
@@ -634,9 +770,12 @@ mod tests {
         peer1.store().insert(*block.cid(), block.data().to_vec());
         peer1.spawn("peer1");
 
-        let syncer = Arc::new(Syncer(peer2.store().clone()));
-        peer2.swarm().sync(*block.cid(), syncer);
-        peer2.swarm().cancel_sync(*block.cid());
-        assert!(peer2.swarm().next().now_or_never().is_none());
+        let id = peer2
+            .swarm()
+            .sync(*block.cid(), std::iter::once(*block.cid()));
+        peer2.swarm().cancel(id);
+        let res = peer2.swarm().next().now_or_never();
+        println!("{:?}", res);
+        assert!(res.is_none());
     }
 }
