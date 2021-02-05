@@ -332,6 +332,10 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         }
                     },
                 },
+                QueryEvent::Progress(id, missing) => {
+                    let event = BitswapEvent::Progress(id, missing);
+                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                }
                 QueryEvent::Complete(id, res) => {
                     if res.is_err() {
                         BLOCK_NOT_FOUND.inc();
@@ -668,6 +672,15 @@ mod tests {
         }
     }
 
+    fn assert_progress(event: BitswapEvent, id: QueryId, missing: usize) {
+        if let BitswapEvent::Progress(id2, missing2) = event {
+            assert_eq!(id2, id);
+            assert_eq!(missing2, missing);
+        } else {
+            panic!("{:?} is not a progress event", event);
+        }
+    }
+
     fn assert_complete_ok(event: BitswapEvent, id: QueryId) {
         if let BitswapEvent::Complete(id2, Ok(())) = event {
             assert_eq!(id2, id);
@@ -740,6 +753,9 @@ mod tests {
 
         let id1 = assert_providers(peer2.swarm().next().await, *b2.cid());
         peer2.swarm().inject_providers(id1, vec![peer1]);
+
+        assert_progress(peer2.swarm().next().await, id, 1);
+        assert_progress(peer2.swarm().next().await, id, 1);
 
         assert_complete_ok(peer2.swarm().next().await, id);
     }

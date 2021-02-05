@@ -68,6 +68,8 @@ impl std::fmt::Display for Response {
 pub enum QueryEvent {
     /// A subquery to run.
     Request(QueryId, Request),
+    /// A progress event.
+    Progress(QueryId, usize),
     /// Complete event.
     Complete(QueryId, Result<(), Cid>),
 }
@@ -292,6 +294,7 @@ impl QueryManager {
         self.events.retain(|event| {
             let (id, req) = match event {
                 QueryEvent::Request(id, req) => (id, req),
+                QueryEvent::Progress(id, _) => return *id != root,
                 QueryEvent::Complete(_, _) => return true,
             };
             if queries.get(id).map(|q| q.hdr.root) != Some(root) {
@@ -449,6 +452,8 @@ impl QueryManager {
     /// Starts a get query for each missing block. If there are no in progress queries
     /// the sync query is marked as complete.
     fn recv_missing_blocks(&mut self, query: Header, missing: Vec<Cid>) {
+        let mut num_missing = 0;
+        let num_missing_ref = &mut num_missing;
         self.sync_query(query.parent.unwrap(), |mgr, parent, mut state| {
             let providers = state.children.remove(&query.id).unwrap_or_default();
             for cid in missing {
@@ -456,12 +461,17 @@ impl QueryManager {
                     .missing
                     .insert(mgr.get(Some(parent.root), cid, providers.iter().copied()));
             }
+            *num_missing_ref = state.missing.len();
             if state.missing.is_empty() && state.children.is_empty() {
                 Transition::Complete(Ok(()))
             } else {
                 Transition::Next(state)
             }
         });
+        if num_missing != 0 {
+            self.events
+                .push_back(QueryEvent::Progress(query.root, num_missing));
+        }
     }
 
     /// Processes the response of a get query.
