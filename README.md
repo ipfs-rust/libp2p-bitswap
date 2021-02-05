@@ -23,25 +23,30 @@ db query. The bitswap api looks as follows:
 
 ```rust
 #[derive(Debug)]
-pub enum BitswapEvent<P: StoreParams> {
+pub enum BitswapEvent {
     /// A get query needs a list of providers to make progress. Once the new set of
     /// providers is determined the get query can be notified using the `inject_providers`
     /// method.
     Providers(QueryId, Cid),
-    /// A sync query needs a list of missing blocks to make progress. Once the set of missing
-    /// blocks is determined the sync query can be notified using the `inject_missing_blocks`
-    /// method.
-    MissingBlocks(QueryId, Cid),
-    /// A peer has sent us a have request. The request can be answered using the `inject_have`
-    /// method.
-    Have(Channel, PeerId, Cid),
-    /// A peer has sent us a block request. The request can be answered using the `inject_block`
-    /// method.
-    Block(Channel, PeerId, Cid),
-    /// Received a block from a peer.
-    Received(QueryId, PeerId, Block<P>),
+    /// Received a block from a peer. Includes the number of known missing blocks for a
+    /// sync query. When a block is received and missing blocks is not empty the counter
+    /// is increased. If missing blocks is empty the counter is decremented.
+    Progress(QueryId, usize),
     /// A get or sync query completed.
-    Complete(QueryId, Result<(), BlockNotFound>),
+    Complete(QueryId, Result<()>),
+}
+
+pub trait BitswapStore: Send + Sync + 'static {
+    /// The store params.
+    type Params: StoreParams;
+    /// A have query needs to know if the block store contains the block.
+    fn contains(&mut self, cid: &Cid) -> Result<bool>;
+    /// A block query needs to retrieve the block from the store.
+    fn get(&mut self, cid: &Cid) -> Result<Option<Vec<u8>>>;
+    /// A block response needs to insert the block into the store.
+    fn insert(&mut self, block: &Block<Self::Params>) -> Result<()>;
+    /// A sync query needs a list of missing blocks to make progress.
+    fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>>;
 }
 
 pub struct BitswapConfig {
@@ -60,6 +65,9 @@ impl<P: StoreParams> Bitswap<P> {
     /// Adds an address for a peer.
     pub fn add_address(&mut self, peer_id: &PeerId, addr: Multiaddr);
 
+    /// Removes an address for a peer.
+    pub fn remove_address(&mut self, peer_id: &PeerId, addr: &Multiaddr);
+
     /// Starts a get query with an initial guess of providers.
     pub fn get(&mut self, cid: Cid, initial: impl Iterator<Item = PeerId>) -> QueryId;
 
@@ -72,17 +80,8 @@ impl<P: StoreParams> Bitswap<P> {
     /// Adds a provider for a cid. Used for handling the `Providers` event.
     pub fn inject_providers(&mut self, id: QueryId, providers: Vec<PeerId>);
 
-    /// Add missing blocks. Used for handling the `MissingBlocks` event.
-    pub fn inject_missing_blocks(&mut self, id: QueryId, missing: Vec<Cid>);
-
-    /// Send a have response. Used for handling the `Have` event.
-    pub fn inject_have(&mut self, channel: Channel, have: bool);
-
-    /// Send a block response. Used for handling the `Block` event.
-    pub fn inject_block(&mut self, channel: Channel, block: Option<Vec<u8>>);
-
-    /// Returns bitswap stats.
-    pub fn stats(&self) -> &BitswapStats;
+    /// Register bitswap stats in a prometheus registry.
+    pub fn register_metrics(&self, registry: &Registry) -> Result<()>;
 
     /// Polls the behaviour for the next bitswap event.
     pub fn poll(&mut self, cx: &mut Context) -> BitswapEvent;
