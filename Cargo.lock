@@ -1287,6 +1287,8 @@ dependencies = [
  "libp2p",
  "multihash",
  "prometheus",
+ "prost",
+ "prost-build",
  "thiserror",
  "tracing",
  "tracing-subscriber",

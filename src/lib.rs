@@ -3,6 +3,8 @@
 #![deny(warnings)]
 
 mod behaviour;
+#[cfg(feature = "compat")]
+mod compat;
 mod protocol;
 mod query;
 mod stats;
