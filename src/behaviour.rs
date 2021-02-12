@@ -532,10 +532,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         request_id,
                         error
                     );
-                    if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id)) {
-                        self.query_manager
-                            .inject_response(id, Response::Have(peer, false));
-                    }
                     match error {
                         OutboundFailure::DialFailure => {
                             OUTBOUND_FAILURE.with_label_values(&["dial_failure"]).inc();
@@ -552,7 +548,28 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             OUTBOUND_FAILURE
                                 .with_label_values(&["unsupported_protocols"])
                                 .inc();
+                            #[cfg(feature = "compat")]
+                            if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id))
+                            {
+                                if let Some(info) = self.query_manager.query_info(id) {
+                                    let ty = match info.label {
+                                        "have" => RequestType::Have,
+                                        "block" => RequestType::Block,
+                                        _ => unreachable!(),
+                                    };
+                                    self.requests.insert(BitswapId::Compat(info.cid), id);
+                                    let compat = CompatMessage::Request(BitswapRequest {
+                                        ty,
+                                        cid: info.cid,
+                                    });
+                                    self.compat.push_back((peer, compat));
+                                }
+                            }
                         }
+                    }
+                    if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id)) {
+                        self.query_manager
+                            .inject_response(id, Response::Have(peer, false));
                     }
                 }
                 RequestResponseEvent::InboundFailure {
