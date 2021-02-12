@@ -5,6 +5,8 @@
 //!
 //! The `Bitswap` struct implements the `NetworkBehaviour` trait. When used, it
 //! will allow providing and reciving IPFS blocks.
+#[cfg(feature = "compat")]
+use crate::compat::{CompatMessage, CompatProtocol, InboundMessage};
 use crate::protocol::{
     BitswapCodec, BitswapProtocol, BitswapRequest, BitswapResponse, RequestType,
 };
@@ -16,14 +18,17 @@ use libipld::error::BlockNotFound;
 use libipld::store::StoreParams;
 use libipld::{Block, Cid, Result};
 use libp2p::core::connection::{ConnectionId, ListenerId};
+#[cfg(feature = "compat")]
+use libp2p::core::either::EitherOutput;
 use libp2p::core::{ConnectedPoint, Multiaddr, PeerId};
 use libp2p::request_response::{
     throttled::{Event as ThrottledEvent, ResponseChannel, Throttled},
     InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponseConfig,
     RequestResponseEvent, RequestResponseMessage,
 };
-use libp2p::swarm::ProtocolsHandler;
-use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters};
+use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters, ProtocolsHandler};
+#[cfg(feature = "compat")]
+use libp2p::swarm::{NotifyHandler, OneShotHandler, ProtocolsHandlerSelect};
 use prometheus::Registry;
 use std::collections::VecDeque;
 use std::error::Error;
@@ -89,6 +94,13 @@ impl Default for BitswapConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum BitswapId {
+    Id(RequestId),
+    #[cfg(feature = "compat")]
+    Cid(Cid),
+}
+
 /// Network behaviour that handles sending and receiving blocks.
 pub struct Bitswap<P: StoreParams> {
     /// Inner behaviour.
@@ -98,9 +110,12 @@ pub struct Bitswap<P: StoreParams> {
     /// Pending requests.
     pending_requests: VecDeque<(QueryId, PeerId, BitswapRequest)>,
     /// Requests.
-    requests: FnvHashMap<RequestId, QueryId>,
+    requests: FnvHashMap<BitswapId, QueryId>,
     /// Bitswap store.
     store: Box<dyn BitswapStore<Params = P>>,
+    /// Outgoing compat messages.
+    #[cfg(feature = "compat")]
+    compat: VecDeque<(PeerId, CompatMessage)>,
 }
 
 impl<P: StoreParams> Bitswap<P> {
@@ -118,6 +133,8 @@ impl<P: StoreParams> Bitswap<P> {
             pending_requests: Default::default(),
             requests: Default::default(),
             store: Box::new(store),
+            #[cfg(feature = "compat")]
+            compat: Default::default(),
         }
     }
 
@@ -191,6 +208,59 @@ impl<P: StoreParams> Bitswap<P> {
         self.inner.send_response(channel, response).unwrap();
     }
 
+    /// Processes an incoming bitswap response.
+    fn inject_response(
+        &mut self,
+        id: BitswapId,
+        peer: PeerId,
+        response: BitswapResponse,
+    ) -> Option<BitswapEvent> {
+        if let Some(id) = self.requests.remove(&id) {
+            match response {
+                BitswapResponse::Have(have) => {
+                    self.query_manager
+                        .inject_response(id, Response::Have(peer, have));
+                }
+                BitswapResponse::Block(data) => {
+                    if let Some(info) = self.query_manager.query_info(id) {
+                        let len = data.len();
+                        if let Ok(block) = Block::new(info.cid, data) {
+                            RECEIVED_BLOCK_BYTES.inc_by(len as u64);
+                            if let Err(err) = self.store.insert(&block) {
+                                self.query_manager.cancel(id);
+                                return Some(BitswapEvent::Complete(id, Err(err)));
+                            } else {
+                                self.query_manager
+                                    .inject_response(id, Response::Block(peer, true));
+                            }
+                        } else {
+                            RECEIVED_INVALID_BLOCK_BYTES.inc_by(len as u64);
+                            self.query_manager
+                                .inject_response(id, Response::Block(peer, false));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn send_pending_requests(&mut self) {
+        // TODO support compat
+        for _ in 0..self.pending_requests.len() {
+            if let Some((qid, peer, request)) = self.pending_requests.pop_front() {
+                match self.inner.send_request(&peer, request) {
+                    Ok(rid) => {
+                        self.requests.insert(BitswapId::Id(rid), qid);
+                    }
+                    Err(request) => {
+                        self.pending_requests.push_back((qid, peer, request));
+                    }
+                }
+            }
+        }
+    }
+
     /// Registers prometheus metrics.
     pub fn register_metrics(&self, registry: &Registry) -> Result<()> {
         registry.register(Box::new(REQUESTS_TOTAL.clone()))?;
@@ -212,11 +282,21 @@ impl<P: StoreParams> Bitswap<P> {
 }
 
 impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
+    #[cfg(not(feature = "compat"))]
     type ProtocolsHandler = <Throttled<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler;
+
+    #[cfg(feature = "compat")]
+    type ProtocolsHandler = ProtocolsHandlerSelect<
+        <Throttled<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler,
+        OneShotHandler<CompatProtocol, CompatMessage, InboundMessage>,
+    >;
     type OutEvent = BitswapEvent;
 
     fn new_handler(&mut self) -> Self::ProtocolsHandler {
-        self.inner.new_handler()
+        #[cfg(not(feature = "compat"))]
+        return self.inner.new_handler();
+        #[cfg(feature = "compat")]
+        self.inner.new_handler().select(OneShotHandler::default())
     }
 
     fn addresses_of_peer(&mut self, peer_id: &PeerId) -> Vec<Multiaddr> {
@@ -289,7 +369,41 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         conn: ConnectionId,
         event: <Self::ProtocolsHandler as ProtocolsHandler>::OutEvent,
     ) {
-        self.inner.inject_event(peer_id, conn, event)
+        #[cfg(not(feature = "compat"))]
+        return self.inner.inject_event(peer_id, conn, event);
+        #[cfg(feature = "compat")]
+        match event {
+            EitherOutput::First(event) => self.inner.inject_event(peer_id, conn, event),
+            EitherOutput::Second(msg) => {
+                for msg in msg.0 {
+                    match msg {
+                        CompatMessage::Request(req) => match req.ty {
+                            RequestType::Have => {
+                                let have = self.store.contains(&req.cid).ok().unwrap_or_default();
+                                let res = BitswapResponse::Have(have);
+                                let msg = CompatMessage::Response(req.cid, res);
+                                self.compat.push_back((peer_id, msg));
+                            }
+                            RequestType::Block => {
+                                let block = self.store.get(&req.cid).ok().unwrap_or_default();
+                                let res = if let Some(block) = block {
+                                    BitswapResponse::Block(block)
+                                } else {
+                                    BitswapResponse::Have(false)
+                                };
+                                let msg = CompatMessage::Response(req.cid, res);
+                                self.compat.push_back((peer_id, msg));
+                            }
+                        },
+                        CompatMessage::Response(cid, res) => {
+                            if let Some(_) = self.inject_response(BitswapId::Cid(cid), peer_id, res) {
+                                // TODO ignore complete error if insert failed
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn poll(
@@ -347,18 +461,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             }
         }
         loop {
-            for _ in 0..self.pending_requests.len() {
-                if let Some((qid, peer, request)) = self.pending_requests.pop_front() {
-                    match self.inner.send_request(&peer, request) {
-                        Ok(rid) => {
-                            self.requests.insert(rid, qid);
-                        }
-                        Err(request) => {
-                            self.pending_requests.push_back((qid, peer, request));
-                        }
-                    }
-                }
-            }
+            self.send_pending_requests();
             let event = match self.inner.poll(cx, pp) {
                 Poll::Ready(NetworkBehaviourAction::GenerateEvent(event)) => event,
                 Poll::Ready(NetworkBehaviourAction::DialAddress { address }) => {
@@ -375,7 +478,10 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
                         peer_id,
                         handler,
+                        #[cfg(not(feature = "compat"))]
                         event,
+                        #[cfg(feature = "compat")]
+                        event: EitherOutput::First(event),
                     });
                 }
                 Poll::Ready(NetworkBehaviourAction::ReportObservedAddr { address, score }) => {
@@ -384,7 +490,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         score,
                     });
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => break,
             };
             let event = match event {
                 ThrottledEvent::Event(event) => event,
@@ -424,39 +530,13 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     RequestResponseMessage::Response {
                         request_id,
                         response,
-                    } => match response {
-                        BitswapResponse::Have(have) => {
-                            let id = self.requests.remove(&request_id).unwrap();
-                            self.query_manager
-                                .inject_response(id, Response::Have(peer, have));
+                    } => {
+                        if let Some(event) =
+                            self.inject_response(BitswapId::Id(request_id), peer, response)
+                        {
+                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                         }
-                        BitswapResponse::Block(data) => {
-                            let id = self.requests.remove(&request_id).unwrap();
-                            let cid = if let Some(info) = self.query_manager.query_info(id) {
-                                &info.cid
-                            } else {
-                                continue;
-                            };
-                            let len = data.len();
-                            if let Ok(block) = Block::new(*cid, data) {
-                                RECEIVED_BLOCK_BYTES.inc_by(len as u64);
-                                if let Err(err) = self.store.insert(&block) {
-                                    self.query_manager.cancel(id);
-                                    let event = BitswapEvent::Complete(id, Err(err));
-                                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(
-                                        event,
-                                    ));
-                                } else {
-                                    self.query_manager
-                                        .inject_response(id, Response::Block(peer, true));
-                                }
-                            } else {
-                                RECEIVED_INVALID_BLOCK_BYTES.inc_by(len as u64);
-                                self.query_manager
-                                    .inject_response(id, Response::Block(peer, false));
-                            }
-                        }
-                    },
+                    }
                 },
                 RequestResponseEvent::ResponseSent { .. } => {}
                 RequestResponseEvent::OutboundFailure {
@@ -470,7 +550,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         request_id,
                         error
                     );
-                    if let Some(id) = self.requests.remove(&request_id) {
+                    if let Some(id) = self.requests.remove(&BitswapId::Id(request_id)) {
                         self.query_manager
                             .inject_response(id, Response::Have(peer, false));
                     }
@@ -527,6 +607,15 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                 }
             }
         }
+        #[cfg(feature = "compat")]
+        while let Some((peer_id, compat)) = self.compat.pop_front() {
+            return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                peer_id,
+                handler: NotifyHandler::Any,
+                event: EitherOutput::Second(compat),
+            });
+        }
+        Poll::Pending
     }
 }
 
