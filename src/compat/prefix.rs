@@ -41,10 +41,10 @@ impl Prefix {
         let version = varint_encode::u64(self.version.into(), &mut buf);
         res.extend_from_slice(version);
         let mut buf = varint_encode::u64_buffer();
-        let codec = varint_encode::u64(self.codec.into(), &mut buf);
+        let codec = varint_encode::u64(self.codec, &mut buf);
         res.extend_from_slice(codec);
         let mut buf = varint_encode::u64_buffer();
-        let mh_type = varint_encode::u64(self.mh_type.into(), &mut buf);
+        let mh_type = varint_encode::u64(self.mh_type, &mut buf);
         res.extend_from_slice(mh_type);
         let mut buf = varint_encode::u64_buffer();
         let mh_len = varint_encode::u64(self.mh_len as u64, &mut buf);

@@ -22,30 +22,35 @@ impl CompatMessage {
         match self {
             CompatMessage::Request(BitswapRequest { ty, cid }) => {
                 let mut wantlist = bitswap_pb::message::Wantlist::default();
-                let mut entry = bitswap_pb::message::wantlist::Entry::default();
-                entry.block = cid.to_bytes();
-                entry.want_type = match ty {
-                    RequestType::Have => bitswap_pb::message::wantlist::WantType::Have,
-                    RequestType::Block => bitswap_pb::message::wantlist::WantType::Block,
-                } as _;
-                entry.send_dont_have = true;
+                let entry = bitswap_pb::message::wantlist::Entry {
+                    block: cid.to_bytes(),
+                    want_type: match ty {
+                        RequestType::Have => bitswap_pb::message::wantlist::WantType::Have,
+                        RequestType::Block => bitswap_pb::message::wantlist::WantType::Block,
+                    } as _,
+                    send_dont_have: true,
+                    cancel: false,
+                    priority: 1,
+                };
                 wantlist.entries.push(entry);
                 msg.wantlist = Some(wantlist);
             }
             CompatMessage::Response(cid, BitswapResponse::Have(have)) => {
-                let mut block_presence = bitswap_pb::message::BlockPresence::default();
-                block_presence.cid = cid.to_bytes();
-                block_presence.r#type = if *have {
-                    bitswap_pb::message::BlockPresenceType::Have
-                } else {
-                    bitswap_pb::message::BlockPresenceType::DontHave
-                } as _;
+                let block_presence = bitswap_pb::message::BlockPresence {
+                    cid: cid.to_bytes(),
+                    r#type: if *have {
+                        bitswap_pb::message::BlockPresenceType::Have
+                    } else {
+                        bitswap_pb::message::BlockPresenceType::DontHave
+                    } as _,
+                };
                 msg.block_presences.push(block_presence);
             }
             CompatMessage::Response(cid, BitswapResponse::Block(bytes)) => {
-                let mut payload = bitswap_pb::message::Block::default();
-                payload.prefix = Prefix::from(cid).to_bytes();
-                payload.data = bytes.to_vec();
+                let payload = bitswap_pb::message::Block {
+                    prefix: Prefix::from(cid).to_bytes(),
+                    data: bytes.to_vec(),
+                };
                 msg.payload.push(payload);
             }
         }

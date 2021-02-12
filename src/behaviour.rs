@@ -286,6 +286,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     type ProtocolsHandler = <Throttled<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler;
 
     #[cfg(feature = "compat")]
+    #[allow(clippy::type_complexity)]
     type ProtocolsHandler = ProtocolsHandlerSelect<
         <Throttled<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler,
         OneShotHandler<CompatProtocol, CompatMessage, InboundMessage>,
@@ -396,9 +397,8 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             }
                         },
                         CompatMessage::Response(cid, res) => {
-                            if let Some(_) = self.inject_response(BitswapId::Cid(cid), peer_id, res) {
-                                // TODO ignore complete error if insert failed
-                            }
+                            self.inject_response(BitswapId::Cid(cid), peer_id, res);
+                            // TODO ignores complete error if insert failed
                         }
                     }
                 }
@@ -608,7 +608,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             }
         }
         #[cfg(feature = "compat")]
-        while let Some((peer_id, compat)) = self.compat.pop_front() {
+        if let Some((peer_id, compat)) = self.compat.pop_front() {
             return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
                 peer_id,
                 handler: NotifyHandler::Any,
