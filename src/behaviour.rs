@@ -866,4 +866,22 @@ mod tests {
         println!("{:?}", res);
         assert!(res.is_none());
     }
+
+    #[cfg(feature = "compat")]
+    #[async_std::test]
+    async fn compat_test() {
+        tracing_try_init();
+        let cid: Cid = "QmXQsqVRpp2W7fbYZHi4aB2Xkqfd3DpwWskZoLVEYigMKC"
+            .parse()
+            .unwrap();
+        let peer_id: PeerId = "QmRSGx67Kq8w7xSBDia7hQfbfuvauMQGgxcwSWw976x4BS"
+            .parse()
+            .unwrap();
+        let multiaddr: Multiaddr = "/ip4/54.173.33.96/tcp/4001".parse().unwrap();
+
+        let mut peer = Peer::new();
+        peer.swarm().add_address(&peer_id, multiaddr);
+        let id = peer.swarm().get(cid, std::iter::once(peer_id));
+        assert_complete_ok(peer.swarm().next().await, id);
+    }
 }

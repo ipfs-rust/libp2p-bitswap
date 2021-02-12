@@ -16,7 +16,7 @@ impl UpgradeInfo for CompatProtocol {
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(b"/ipfs/bitswap/1.1.0")
+        iter::once(b"/ipfs/bitswap/1.2.0")
     }
 }
 
@@ -44,7 +44,7 @@ impl UpgradeInfo for CompatMessage {
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(b"/ipfs/bitswap/1.1.0")
+        iter::once(b"/ipfs/bitswap/1.2.0")
     }
 }
 
