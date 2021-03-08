@@ -13,6 +13,8 @@ use crate::protocol::{
 use crate::query::{QueryEvent, QueryId, QueryManager, Request, Response};
 use crate::stats::*;
 use fnv::FnvHashMap;
+#[cfg(feature = "compat")]
+use fnv::FnvHashSet;
 use futures::task::{Context, Poll};
 use libipld::error::BlockNotFound;
 use libipld::store::StoreParams;
@@ -119,9 +121,12 @@ pub struct Bitswap<P: StoreParams> {
     requests: FnvHashMap<BitswapId, QueryId>,
     /// Bitswap store.
     store: Box<dyn BitswapStore<Params = P>>,
-    /// Outgoing compat messages.
+    /// Compat peers.
     #[cfg(feature = "compat")]
-    compat: VecDeque<(PeerId, CompatMessage)>,
+    compat: FnvHashSet<PeerId>,
+    /// Compat queue.
+    #[cfg(feature = "compat")]
+    compat_queue: VecDeque<(PeerId, CompatMessage)>,
 }
 
 impl<P: StoreParams> Bitswap<P> {
@@ -141,6 +146,8 @@ impl<P: StoreParams> Bitswap<P> {
             store: Box::new(store),
             #[cfg(feature = "compat")]
             compat: Default::default(),
+            #[cfg(feature = "compat")]
+            compat_queue: Default::default(),
         }
     }
 
@@ -235,7 +242,7 @@ impl<P: StoreParams> Bitswap<P> {
             #[cfg(feature = "compat")]
             BitswapChannel::Compat(peer_id) => {
                 let msg = CompatMessage::Response(request.cid, response);
-                self.compat.push_back((peer_id, msg));
+                self.compat_queue.push_back((peer_id, msg));
             }
         }
     }
@@ -266,6 +273,7 @@ impl<P: StoreParams> Bitswap<P> {
                                     .inject_response(id, Response::Block(peer, true));
                             }
                         } else {
+                            tracing::trace!("received invalid block");
                             RECEIVED_INVALID_BLOCK_BYTES.inc_by(len as u64);
                             self.query_manager
                                 .inject_response(id, Response::Block(peer, false));
@@ -306,7 +314,9 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     }
 
     fn inject_disconnected(&mut self, peer_id: &PeerId) {
-        self.inner.inject_disconnected(peer_id)
+        self.inner.inject_disconnected(peer_id);
+        #[cfg(feature = "compat")]
+        self.compat.remove(peer_id);
     }
 
     fn inject_connection_established(
@@ -376,9 +386,11 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                 for msg in msg.0 {
                     match msg {
                         CompatMessage::Request(req) => {
+                            tracing::trace!("received compat request");
                             self.inject_request(BitswapChannel::Compat(peer_id), req);
                         }
                         CompatMessage::Response(cid, res) => {
+                            tracing::trace!("received compat response");
                             self.inject_response(BitswapId::Compat(cid), peer_id, res);
                             // TODO ignores complete error if insert failed
                         }
@@ -449,6 +461,18 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         loop {
             for _ in 0..self.pending_requests.len() {
                 if let Some((qid, peer, request)) = self.pending_requests.pop_front() {
+                    #[cfg(feature = "compat")]
+                    if self.compat.contains(&peer) {
+                        tracing::trace!("sending compat request");
+                        if let Some(info) = self.query_manager.query_info(qid) {
+                            self.requests.insert(BitswapId::Compat(info.cid), qid);
+                            return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                                peer_id: peer,
+                                handler: NotifyHandler::Any,
+                                event: EitherOutput::Second(CompatMessage::Request(request)),
+                            });
+                        }
+                    }
                     match self.inner.send_request(&peer, request) {
                         Ok(rid) => {
                             self.requests.insert(BitswapId::Bitswap(rid), qid);
@@ -557,12 +581,11 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                         "block" => RequestType::Block,
                                         _ => unreachable!(),
                                     };
-                                    self.requests.insert(BitswapId::Compat(info.cid), id);
-                                    let compat = CompatMessage::Request(BitswapRequest {
-                                        ty,
-                                        cid: info.cid,
-                                    });
-                                    self.compat.push_back((peer, compat));
+                                    let request = BitswapRequest { ty, cid: info.cid };
+                                    self.pending_requests.push_back((id, peer, request));
+
+                                    tracing::trace!("adding compat peer {}", peer);
+                                    self.compat.insert(peer);
                                 }
                             }
                         }
@@ -607,7 +630,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             }
         }
         #[cfg(feature = "compat")]
-        if let Some((peer_id, compat)) = self.compat.pop_front() {
+        if let Some((peer_id, compat)) = self.compat_queue.pop_front() {
             return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
                 peer_id,
                 handler: NotifyHandler::Any,
