@@ -70,6 +70,7 @@ pub trait BitswapStore: Send + Sync + 'static {
 }
 
 /// Bitswap configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BitswapConfig {
     /// Timeout of a request.
     pub request_timeout: Duration,
