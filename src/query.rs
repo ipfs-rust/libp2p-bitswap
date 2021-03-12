@@ -487,9 +487,11 @@ impl QueryManager {
                 if providers.is_empty() {
                     Transition::Complete(Err(query.cid))
                 } else {
-                    state
-                        .children
-                        .insert(mgr.missing_blocks(parent.root, query.cid), providers);
+                    if state.missing.is_empty() {
+                        state
+                            .children
+                            .insert(mgr.missing_blocks(parent.root, parent.cid), providers);
+                    }
                     Transition::Next(state)
                 }
             });

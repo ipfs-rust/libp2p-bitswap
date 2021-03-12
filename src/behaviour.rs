@@ -712,14 +712,17 @@ mod tests {
             Ok(())
         }
         fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>> {
-            if let Some(data) = self.get(cid)? {
-                let block = Block::<Self::Params>::new_unchecked(*cid, data);
-                let mut refs = vec![];
-                block.references(&mut refs)?;
-                Ok(refs)
-            } else {
-                panic!("missing_blocks called before insert");
+            let mut stack = vec![*cid];
+            let mut missing = vec![];
+            while let Some(cid) = stack.pop() {
+                if let Some(data) = self.get(&cid)? {
+                    let block = Block::<Self::Params>::new_unchecked(cid, data);
+                    block.references(&mut stack)?;
+                } else {
+                    missing.push(cid);
+                }
             }
+            Ok(missing)
         }
     }
 
