@@ -65,6 +65,13 @@ pub trait BitswapStore: Send + Sync + 'static {
     fn get(&mut self, cid: &Cid) -> Result<Option<Vec<u8>>>;
     /// A block response needs to insert the block into the store.
     fn insert(&mut self, block: &Block<Self::Params>) -> Result<()>;
+    /// A block response needs to insert the block into the store.
+    fn insert_many(&mut self, blocks: &[Block<Self::Params>]) -> Result<()> {
+        for block in blocks {
+            self.insert(block)?;
+        }
+        Ok(())
+    }
     /// A sync query needs a list of missing blocks to make progress.
     fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>>;
 }
@@ -128,6 +135,8 @@ pub struct Bitswap<P: StoreParams> {
     /// Compat queue.
     #[cfg(feature = "compat")]
     compat_queue: VecDeque<(PeerId, CompatMessage)>,
+    /// Insert batch.
+    batch: Vec<Block<P>>,
 }
 
 impl<P: StoreParams> Bitswap<P> {
@@ -149,6 +158,7 @@ impl<P: StoreParams> Bitswap<P> {
             compat: Default::default(),
             #[cfg(feature = "compat")]
             compat_queue: Default::default(),
+            batch: Default::default(),
         }
     }
 
@@ -266,13 +276,9 @@ impl<P: StoreParams> Bitswap<P> {
                         let len = data.len();
                         if let Ok(block) = Block::new(info.cid, data) {
                             RECEIVED_BLOCK_BYTES.inc_by(len as u64);
-                            if let Err(err) = self.store.insert(&block) {
-                                self.query_manager.cancel(id);
-                                return Some(BitswapEvent::Complete(id, Err(err)));
-                            } else {
-                                self.query_manager
-                                    .inject_response(id, Response::Block(peer, true));
-                            }
+                            self.batch.push(block);
+                            self.query_manager
+                                .inject_response(id, Response::Block(peer, true));
                         } else {
                             tracing::trace!("received invalid block");
                             RECEIVED_INVALID_BLOCK_BYTES.inc_by(len as u64);
@@ -284,6 +290,15 @@ impl<P: StoreParams> Bitswap<P> {
             }
         }
         None
+    }
+
+    fn insert_batch(&mut self) {
+        if !self.batch.is_empty() {
+            if let Err(err) = self.store.insert_many(&self.batch) {
+                tracing::error!("error inserting blocks {}", err);
+            }
+            self.batch.clear();
+        }
     }
 }
 
@@ -432,16 +447,19 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         let event = BitswapEvent::Providers(id, cid);
                         return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                     }
-                    Request::MissingBlocks(cid) => match self.store.missing_blocks(&cid) {
-                        Ok(missing) => {
-                            MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
-                            self.query_manager
-                                .inject_response(id, Response::MissingBlocks(missing));
-                        }
-                        Err(err) => {
-                            self.query_manager.cancel(id);
-                            let event = BitswapEvent::Complete(id, Err(err));
-                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                    Request::MissingBlocks(cid) => {
+                        self.insert_batch();
+                        match self.store.missing_blocks(&cid) {
+                            Ok(missing) => {
+                                MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
+                                self.query_manager
+                                    .inject_response(id, Response::MissingBlocks(missing));
+                            }
+                            Err(err) => {
+                                self.query_manager.cancel(id);
+                                let event = BitswapEvent::Complete(id, Err(err));
+                                return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                            }
                         }
                     },
                 },
