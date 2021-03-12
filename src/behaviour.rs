@@ -24,14 +24,14 @@ use libp2p::core::connection::{ConnectionId, ListenerId};
 use libp2p::core::either::EitherOutput;
 use libp2p::core::{ConnectedPoint, Multiaddr, PeerId};
 use libp2p::request_response::{
-    throttled::{Event as ThrottledEvent, ResponseChannel, Throttled},
-    InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponseConfig,
-    RequestResponseEvent, RequestResponseMessage,
+    InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse, RequestResponseConfig,
+    RequestResponseEvent, RequestResponseMessage, ResponseChannel,
 };
 use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters, ProtocolsHandler};
 #[cfg(feature = "compat")]
 use libp2p::swarm::{NotifyHandler, OneShotHandler, ProtocolsHandlerSelect};
 use prometheus::Registry;
+#[cfg(feature = "compat")]
 use std::collections::VecDeque;
 use std::error::Error;
 use std::num::NonZeroU16;
@@ -120,11 +120,9 @@ enum BitswapChannel {
 /// Network behaviour that handles sending and receiving blocks.
 pub struct Bitswap<P: StoreParams> {
     /// Inner behaviour.
-    inner: Throttled<BitswapCodec<P>>,
+    inner: RequestResponse<BitswapCodec<P>>,
     /// Query manager.
     query_manager: QueryManager,
-    /// Pending requests.
-    pending_requests: VecDeque<(QueryId, PeerId, BitswapRequest)>,
     /// Requests.
     requests: FnvHashMap<BitswapId, QueryId>,
     /// Bitswap store.
@@ -146,19 +144,17 @@ impl<P: StoreParams> Bitswap<P> {
         rr_config.set_connection_keep_alive(config.connection_keep_alive);
         rr_config.set_request_timeout(config.request_timeout);
         let protocols = std::iter::once((BitswapProtocol, ProtocolSupport::Full));
-        let mut inner = Throttled::new(BitswapCodec::<P>::default(), protocols, rr_config);
-        inner.set_receive_limit(config.receive_limit);
+        let inner = RequestResponse::new(BitswapCodec::<P>::default(), protocols, rr_config);
         Self {
             inner,
             query_manager: Default::default(),
-            pending_requests: Default::default(),
             requests: Default::default(),
             store: Box::new(store),
             #[cfg(feature = "compat")]
             compat: Default::default(),
             #[cfg(feature = "compat")]
             compat_queue: Default::default(),
-            batch: Default::default(),
+            batch: Vec::with_capacity(100),
         }
     }
 
@@ -304,12 +300,12 @@ impl<P: StoreParams> Bitswap<P> {
 
 impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     #[cfg(not(feature = "compat"))]
-    type ProtocolsHandler = <Throttled<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler;
+    type ProtocolsHandler = <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler;
 
     #[cfg(feature = "compat")]
     #[allow(clippy::type_complexity)]
     type ProtocolsHandler = ProtocolsHandlerSelect<
-        <Throttled<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler,
+        <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler,
         OneShotHandler<CompatProtocol, CompatMessage, InboundMessage>,
     >;
     type OutEvent = BitswapEvent;
@@ -434,14 +430,16 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             ty: RequestType::Have,
                             cid,
                         };
-                        self.pending_requests.push_back((id, peer_id, req));
+                        let rid = self.inner.send_request(&peer_id, req);
+                        self.requests.insert(BitswapId::Bitswap(rid), id);
                     }
                     Request::Block(peer_id, cid) => {
                         let req = BitswapRequest {
                             ty: RequestType::Block,
                             cid,
                         };
-                        self.pending_requests.push_back((id, peer_id, req));
+                        let rid = self.inner.send_request(&peer_id, req);
+                        self.requests.insert(BitswapId::Bitswap(rid), id);
                     }
                     Request::Providers(cid) => {
                         let event = BitswapEvent::Providers(id, cid);
@@ -478,30 +476,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             }
         }
         loop {
-            for _ in 0..self.pending_requests.len() {
-                if let Some((qid, peer, request)) = self.pending_requests.pop_front() {
-                    #[cfg(feature = "compat")]
-                    if self.compat.contains(&peer) {
-                        tracing::trace!("sending compat request");
-                        if let Some(info) = self.query_manager.query_info(qid) {
-                            self.requests.insert(BitswapId::Compat(info.cid), qid);
-                            return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
-                                peer_id: peer,
-                                handler: NotifyHandler::Any,
-                                event: EitherOutput::Second(CompatMessage::Request(request)),
-                            });
-                        }
-                    }
-                    match self.inner.send_request(&peer, request) {
-                        Ok(rid) => {
-                            self.requests.insert(BitswapId::Bitswap(rid), qid);
-                        }
-                        Err(request) => {
-                            self.pending_requests.push_back((qid, peer, request));
-                        }
-                    }
-                }
-            }
             let event = match self.inner.poll(cx, pp) {
                 Poll::Ready(NetworkBehaviourAction::GenerateEvent(event)) => event,
                 Poll::Ready(NetworkBehaviourAction::DialAddress { address }) => {
@@ -531,19 +505,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     });
                 }
                 Poll::Pending => break,
-            };
-            let event = match event {
-                ThrottledEvent::Event(event) => event,
-                ThrottledEvent::ResumeSending(peer_id) => {
-                    THROTTLED_OUTBOUND.inc();
-                    tracing::trace!("resume sending {}", peer_id);
-                    continue;
-                }
-                ThrottledEvent::TooManyInboundRequests(peer_id) => {
-                    THROTTLED_INBOUND.inc();
-                    tracing::trace!("too many inbound requests from {}", peer_id);
-                    continue;
-                }
             };
             match event {
                 RequestResponseEvent::Message { peer, message } => match message {
@@ -601,10 +562,14 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                         _ => unreachable!(),
                                     };
                                     let request = BitswapRequest { ty, cid: info.cid };
-                                    self.pending_requests.push_back((id, peer, request));
-
+                                    self.requests.insert(BitswapId::Compat(info.cid), id);
                                     tracing::trace!("adding compat peer {}", peer);
                                     self.compat.insert(peer);
+                                    return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                                        peer_id: peer,
+                                        handler: NotifyHandler::Any,
+                                        event: EitherOutput::Second(CompatMessage::Request(request)),
+                                    });
                                 }
                             }
                         }
