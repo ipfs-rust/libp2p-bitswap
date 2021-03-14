@@ -24,8 +24,8 @@ use libp2p::core::connection::{ConnectionId, ListenerId};
 use libp2p::core::either::EitherOutput;
 use libp2p::core::{ConnectedPoint, Multiaddr, PeerId};
 use libp2p::request_response::{
-    InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse, RequestResponseConfig,
-    RequestResponseEvent, RequestResponseMessage, ResponseChannel,
+    InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse,
+    RequestResponseConfig, RequestResponseEvent, RequestResponseMessage, ResponseChannel,
 };
 use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters, ProtocolsHandler};
 #[cfg(feature = "compat")]
@@ -255,12 +255,7 @@ impl<P: StoreParams> Bitswap<P> {
     }
 
     /// Processes an incoming bitswap response.
-    fn inject_response(
-        &mut self,
-        id: BitswapId,
-        peer: PeerId,
-        response: BitswapResponse,
-    ) -> Option<BitswapEvent> {
+    fn inject_response(&mut self, id: BitswapId, peer: PeerId, response: BitswapResponse) {
         if let Some(id) = self.requests.remove(&id) {
             match response {
                 BitswapResponse::Have(have) => {
@@ -285,10 +280,10 @@ impl<P: StoreParams> Bitswap<P> {
                 }
             }
         }
-        None
     }
 
-    fn insert_batch(&mut self) {
+    /// Flush batch to disk.
+    fn flush_batch(&mut self) {
         if !self.batch.is_empty() {
             if let Err(err) = self.store.insert_many(&self.batch) {
                 tracing::error!("error inserting blocks {}", err);
@@ -296,11 +291,78 @@ impl<P: StoreParams> Bitswap<P> {
             self.batch.clear();
         }
     }
+
+    fn inject_outbound_failure(
+        &mut self,
+        peer: &PeerId,
+        request_id: RequestId,
+        error: &OutboundFailure,
+    ) {
+        tracing::trace!(
+            "bitswap outbound failure {} {} {:?}",
+            peer,
+            request_id,
+            error
+        );
+        match error {
+            OutboundFailure::DialFailure => {
+                OUTBOUND_FAILURE.with_label_values(&["dial_failure"]).inc();
+            }
+            OutboundFailure::Timeout => {
+                OUTBOUND_FAILURE.with_label_values(&["timeout"]).inc();
+            }
+            OutboundFailure::ConnectionClosed => {
+                OUTBOUND_FAILURE
+                    .with_label_values(&["connection_closed"])
+                    .inc();
+            }
+            OutboundFailure::UnsupportedProtocols => {
+                OUTBOUND_FAILURE
+                    .with_label_values(&["unsupported_protocols"])
+                    .inc();
+            }
+        }
+    }
+
+    fn inject_inbound_failure(
+        &mut self,
+        peer: &PeerId,
+        request_id: RequestId,
+        error: &InboundFailure,
+    ) {
+        tracing::trace!(
+            "bitswap inbound failure {} {} {:?}",
+            peer,
+            request_id,
+            error
+        );
+        match error {
+            InboundFailure::Timeout => {
+                INBOUND_FAILURE.with_label_values(&["timeout"]).inc();
+            }
+            InboundFailure::ConnectionClosed => {
+                INBOUND_FAILURE
+                    .with_label_values(&["connection_closed"])
+                    .inc();
+            }
+            InboundFailure::UnsupportedProtocols => {
+                INBOUND_FAILURE
+                    .with_label_values(&["unsupported_protocols"])
+                    .inc();
+            }
+            InboundFailure::ResponseOmission => {
+                INBOUND_FAILURE
+                    .with_label_values(&["response_omission"])
+                    .inc();
+            }
+        }
+    }
 }
 
 impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     #[cfg(not(feature = "compat"))]
-    type ProtocolsHandler = <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler;
+    type ProtocolsHandler =
+        <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler;
 
     #[cfg(feature = "compat")]
     #[allow(clippy::type_complexity)]
@@ -404,7 +466,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         CompatMessage::Response(cid, res) => {
                             tracing::trace!("received compat response");
                             self.inject_response(BitswapId::Compat(cid), peer_id, res);
-                            // TODO ignores complete error if insert failed
                         }
                     }
                 }
@@ -446,7 +507,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                     }
                     Request::MissingBlocks(cid) => {
-                        self.insert_batch();
+                        self.flush_batch();
                         match self.store.missing_blocks(&cid) {
                             Ok(missing) => {
                                 MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
@@ -459,7 +520,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                 return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                             }
                         }
-                    },
+                    }
                 },
                 QueryEvent::Progress(id, missing) => {
                     let event = BitswapEvent::Progress(id, missing);
@@ -516,13 +577,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     RequestResponseMessage::Response {
                         request_id,
                         response,
-                    } => {
-                        if let Some(event) =
-                            self.inject_response(BitswapId::Bitswap(request_id), peer, response)
-                        {
-                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                        }
-                    }
+                    } => self.inject_response(BitswapId::Bitswap(request_id), peer, response),
                 },
                 RequestResponseEvent::ResponseSent { .. } => {}
                 RequestResponseEvent::OutboundFailure {
@@ -530,47 +585,25 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     request_id,
                     error,
                 } => {
-                    tracing::trace!(
-                        "bitswap outbound failure {} {} {:?}",
-                        peer,
-                        request_id,
-                        error
-                    );
-                    match error {
-                        OutboundFailure::DialFailure => {
-                            OUTBOUND_FAILURE.with_label_values(&["dial_failure"]).inc();
-                        }
-                        OutboundFailure::Timeout => {
-                            OUTBOUND_FAILURE.with_label_values(&["timeout"]).inc();
-                        }
-                        OutboundFailure::ConnectionClosed => {
-                            OUTBOUND_FAILURE
-                                .with_label_values(&["connection_closed"])
-                                .inc();
-                        }
-                        OutboundFailure::UnsupportedProtocols => {
-                            OUTBOUND_FAILURE
-                                .with_label_values(&["unsupported_protocols"])
-                                .inc();
-                            #[cfg(feature = "compat")]
-                            if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id))
-                            {
-                                if let Some(info) = self.query_manager.query_info(id) {
-                                    let ty = match info.label {
-                                        "have" => RequestType::Have,
-                                        "block" => RequestType::Block,
-                                        _ => unreachable!(),
-                                    };
-                                    let request = BitswapRequest { ty, cid: info.cid };
-                                    self.requests.insert(BitswapId::Compat(info.cid), id);
-                                    tracing::trace!("adding compat peer {}", peer);
-                                    self.compat.insert(peer);
-                                    return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
-                                        peer_id: peer,
-                                        handler: NotifyHandler::Any,
-                                        event: EitherOutput::Second(CompatMessage::Request(request)),
-                                    });
-                                }
+                    self.inject_outbound_failure(&peer, request_id, &error);
+                    #[cfg(feature = "compat")]
+                    if let OutboundFailure::UnsupportedProtocols = error {
+                        if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id)) {
+                            if let Some(info) = self.query_manager.query_info(id) {
+                                let ty = match info.label {
+                                    "have" => RequestType::Have,
+                                    "block" => RequestType::Block,
+                                    _ => unreachable!(),
+                                };
+                                let request = BitswapRequest { ty, cid: info.cid };
+                                self.requests.insert(BitswapId::Compat(info.cid), id);
+                                tracing::trace!("adding compat peer {}", peer);
+                                self.compat.insert(peer);
+                                return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                                    peer_id: peer,
+                                    handler: NotifyHandler::Any,
+                                    event: EitherOutput::Second(CompatMessage::Request(request)),
+                                });
                             }
                         }
                     }
@@ -584,32 +617,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     request_id,
                     error,
                 } => {
-                    tracing::trace!(
-                        "bitswap inbound failure {} {} {:?}",
-                        peer,
-                        request_id,
-                        error
-                    );
-                    match error {
-                        InboundFailure::Timeout => {
-                            INBOUND_FAILURE.with_label_values(&["timeout"]).inc();
-                        }
-                        InboundFailure::ConnectionClosed => {
-                            INBOUND_FAILURE
-                                .with_label_values(&["connection_closed"])
-                                .inc();
-                        }
-                        InboundFailure::UnsupportedProtocols => {
-                            INBOUND_FAILURE
-                                .with_label_values(&["unsupported_protocols"])
-                                .inc();
-                        }
-                        InboundFailure::ResponseOmission => {
-                            INBOUND_FAILURE
-                                .with_label_values(&["response_omission"])
-                                .inc();
-                        }
-                    }
+                    self.inject_inbound_failure(&peer, request_id, &error);
                 }
             }
         }
