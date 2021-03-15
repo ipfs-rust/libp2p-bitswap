@@ -527,49 +527,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                 },
             }
         }
-        while let Some(query) = self.query_manager.next() {
-            match query {
-                QueryEvent::Request(id, req) => match req {
-                    Request::Have(peer_id, cid) => {
-                        let req = BitswapRequest {
-                            ty: RequestType::Have,
-                            cid,
-                        };
-                        let rid = self.inner.send_request(&peer_id, req);
-                        self.requests.insert(BitswapId::Bitswap(rid), id);
-                    }
-                    Request::Block(peer_id, cid) => {
-                        let req = BitswapRequest {
-                            ty: RequestType::Block,
-                            cid,
-                        };
-                        let rid = self.inner.send_request(&peer_id, req);
-                        self.requests.insert(BitswapId::Bitswap(rid), id);
-                    }
-                    Request::Providers(cid) => {
-                        let event = BitswapEvent::Providers(id, cid);
-                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                    }
-                    Request::MissingBlocks(cid) => {
-                        self.db_tx
-                            .unbounded_send(DbRequest::MissingBlocks(id, cid))
-                            .ok();
-                    }
-                },
-                QueryEvent::Progress(id, missing) => {
-                    let event = BitswapEvent::Progress(id, missing);
-                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                }
-                QueryEvent::Complete(id, res) => {
-                    if res.is_err() {
-                        BLOCK_NOT_FOUND.inc();
-                    }
-                    let event =
-                        BitswapEvent::Complete(id, res.map_err(|cid| BlockNotFound(cid).into()));
-                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                }
-            }
-        }
         loop {
             let event = match self.inner.poll(cx, pp) {
                 Poll::Ready(NetworkBehaviourAction::GenerateEvent(event)) => event,
@@ -652,6 +609,49 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     error,
                 } => {
                     self.inject_inbound_failure(&peer, request_id, &error);
+                }
+            }
+        }
+        while let Some(query) = self.query_manager.next() {
+            match query {
+                QueryEvent::Request(id, req) => match req {
+                    Request::Have(peer_id, cid) => {
+                        let req = BitswapRequest {
+                            ty: RequestType::Have,
+                            cid,
+                        };
+                        let rid = self.inner.send_request(&peer_id, req);
+                        self.requests.insert(BitswapId::Bitswap(rid), id);
+                    }
+                    Request::Block(peer_id, cid) => {
+                        let req = BitswapRequest {
+                            ty: RequestType::Block,
+                            cid,
+                        };
+                        let rid = self.inner.send_request(&peer_id, req);
+                        self.requests.insert(BitswapId::Bitswap(rid), id);
+                    }
+                    Request::Providers(cid) => {
+                        let event = BitswapEvent::Providers(id, cid);
+                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                    }
+                    Request::MissingBlocks(cid) => {
+                        self.db_tx
+                            .unbounded_send(DbRequest::MissingBlocks(id, cid))
+                            .ok();
+                    }
+                },
+                QueryEvent::Progress(id, missing) => {
+                    let event = BitswapEvent::Progress(id, missing);
+                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                }
+                QueryEvent::Complete(id, res) => {
+                    if res.is_err() {
+                        BLOCK_NOT_FOUND.inc();
+                    }
+                    let event =
+                        BitswapEvent::Complete(id, res.map_err(|cid| BlockNotFound(cid).into()));
+                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                 }
             }
         }
