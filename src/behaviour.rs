@@ -33,10 +33,7 @@ use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters, Pr
 #[cfg(feature = "compat")]
 use libp2p::swarm::{NotifyHandler, OneShotHandler, ProtocolsHandlerSelect};
 use prometheus::Registry;
-#[cfg(feature = "compat")]
-use std::collections::VecDeque;
 use std::error::Error;
-use std::num::NonZeroU16;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,8 +84,6 @@ pub struct BitswapConfig {
     pub request_timeout: Duration,
     /// Time a connection is kept alive.
     pub connection_keep_alive: Duration,
-    /// The number of concurrent requests per peer.
-    pub receive_limit: NonZeroU16,
 }
 
 impl BitswapConfig {
@@ -97,7 +92,6 @@ impl BitswapConfig {
         Self {
             request_timeout: Duration::from_secs(10),
             connection_keep_alive: Duration::from_secs(10),
-            receive_limit: NonZeroU16::new(20).expect("20 > 0"),
         }
     }
 }
@@ -118,7 +112,7 @@ enum BitswapId {
 enum BitswapChannel {
     Bitswap(Channel),
     #[cfg(feature = "compat")]
-    Compat(PeerId),
+    Compat(PeerId, Cid),
 }
 
 /// Network behaviour that handles sending and receiving blocks.
@@ -134,9 +128,6 @@ pub struct Bitswap<P: StoreParams> {
     /// Compat peers.
     #[cfg(feature = "compat")]
     compat: FnvHashSet<PeerId>,
-    /// Compat queue.
-    #[cfg(feature = "compat")]
-    compat_queue: VecDeque<(PeerId, CompatMessage)>,
     /// Insert batch.
     batch: Vec<Block<P>>,
     tx: mpsc::UnboundedSender<(BitswapChannel, BitswapRequest)>,
@@ -160,8 +151,6 @@ impl<P: StoreParams> Bitswap<P> {
             store,
             #[cfg(feature = "compat")]
             compat: Default::default(),
-            #[cfg(feature = "compat")]
-            compat_queue: Default::default(),
             batch: Vec::with_capacity(100),
             tx,
             rx,
@@ -479,7 +468,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     match msg {
                         CompatMessage::Request(req) => {
                             tracing::trace!("received compat request");
-                            self.inject_request(BitswapChannel::Compat(peer_id), req);
+                            self.inject_request(BitswapChannel::Compat(peer_id, req.cid), req);
                         }
                         CompatMessage::Response(cid, res) => {
                             tracing::trace!("received compat response");
@@ -644,20 +633,16 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                 BitswapChannel::Bitswap(channel) => {
                     self.inner.send_response(channel, response).ok();
                 }
-                _ => {} /*#[cfg(feature = "compat")]
-                        BitswapChannel::Compat(peer_id) => {
-                            let msg = CompatMessage::Response(request.cid, response);
-                            self.compat_queue.push_back((peer_id, msg));
-                        }*/
+                #[cfg(feature = "compat")]
+                BitswapChannel::Compat(peer_id, cid) => {
+                    let compat = CompatMessage::Response(cid, response);
+                    return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                        peer_id,
+                        handler: NotifyHandler::Any,
+                        event: EitherOutput::Second(compat),
+                    });
+                }
             }
-        }
-        #[cfg(feature = "compat")]
-        if let Some((peer_id, compat)) = self.compat_queue.pop_front() {
-            return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
-                peer_id,
-                handler: NotifyHandler::Any,
-                event: EitherOutput::Second(compat),
-            });
         }
         Poll::Pending
     }
@@ -719,20 +704,20 @@ mod tests {
 
     impl BitswapStore for Store {
         type Params = DefaultParams;
-        fn contains(&mut self, cid: &Cid) -> Result<bool> {
+        fn contains(&self, cid: &Cid) -> Result<bool> {
             Ok(self.0.lock().unwrap().contains_key(cid))
         }
-        fn get(&mut self, cid: &Cid) -> Result<Option<Vec<u8>>> {
+        fn get(&self, cid: &Cid) -> Result<Option<Vec<u8>>> {
             Ok(self.0.lock().unwrap().get(cid).cloned())
         }
-        fn insert(&mut self, block: &Block<Self::Params>) -> Result<()> {
+        fn insert(&self, block: &Block<Self::Params>) -> Result<()> {
             self.0
                 .lock()
                 .unwrap()
                 .insert(*block.cid(), block.data().to_vec());
             Ok(())
         }
-        fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>> {
+        fn missing_blocks(&self, cid: &Cid) -> Result<Vec<Cid>> {
             let mut stack = vec![*cid];
             let mut missing = vec![];
             while let Some(cid) = stack.pop() {
