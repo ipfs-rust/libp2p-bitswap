@@ -15,6 +15,8 @@ use crate::stats::*;
 use fnv::FnvHashMap;
 #[cfg(feature = "compat")]
 use fnv::FnvHashSet;
+use futures::channel::mpsc;
+use futures::stream::{Stream, StreamExt};
 use futures::task::{Context, Poll};
 use libipld::error::BlockNotFound;
 use libipld::store::StoreParams;
@@ -35,6 +37,8 @@ use prometheus::Registry;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::num::NonZeroU16;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Bitswap response channel.
@@ -60,20 +64,20 @@ pub trait BitswapStore: Send + Sync + 'static {
     /// The store params.
     type Params: StoreParams;
     /// A have query needs to know if the block store contains the block.
-    fn contains(&mut self, cid: &Cid) -> Result<bool>;
+    fn contains(&self, cid: &Cid) -> Result<bool>;
     /// A block query needs to retrieve the block from the store.
-    fn get(&mut self, cid: &Cid) -> Result<Option<Vec<u8>>>;
+    fn get(&self, cid: &Cid) -> Result<Option<Vec<u8>>>;
     /// A block response needs to insert the block into the store.
-    fn insert(&mut self, block: &Block<Self::Params>) -> Result<()>;
+    fn insert(&self, block: &Block<Self::Params>) -> Result<()>;
     /// A block response needs to insert the block into the store.
-    fn insert_many(&mut self, blocks: &[Block<Self::Params>]) -> Result<()> {
+    fn insert_many(&self, blocks: &[Block<Self::Params>]) -> Result<()> {
         for block in blocks {
             self.insert(block)?;
         }
         Ok(())
     }
     /// A sync query needs a list of missing blocks to make progress.
-    fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>>;
+    fn missing_blocks(&self, cid: &Cid) -> Result<Vec<Cid>>;
 }
 
 /// Bitswap configuration.
@@ -126,7 +130,7 @@ pub struct Bitswap<P: StoreParams> {
     /// Requests.
     requests: FnvHashMap<BitswapId, QueryId>,
     /// Bitswap store.
-    store: Box<dyn BitswapStore<Params = P>>,
+    store: Arc<dyn BitswapStore<Params = P>>,
     /// Compat peers.
     #[cfg(feature = "compat")]
     compat: FnvHashSet<PeerId>,
@@ -135,6 +139,8 @@ pub struct Bitswap<P: StoreParams> {
     compat_queue: VecDeque<(PeerId, CompatMessage)>,
     /// Insert batch.
     batch: Vec<Block<P>>,
+    tx: mpsc::UnboundedSender<(BitswapChannel, BitswapRequest)>,
+    rx: mpsc::UnboundedReceiver<(BitswapChannel, BitswapResponse)>,
 }
 
 impl<P: StoreParams> Bitswap<P> {
@@ -145,16 +151,20 @@ impl<P: StoreParams> Bitswap<P> {
         rr_config.set_request_timeout(config.request_timeout);
         let protocols = std::iter::once((BitswapProtocol, ProtocolSupport::Full));
         let inner = RequestResponse::new(BitswapCodec::<P>::default(), protocols, rr_config);
+        let store = Arc::new(store);
+        let (tx, rx) = start_request_thread(store.clone());
         Self {
             inner,
             query_manager: Default::default(),
             requests: Default::default(),
-            store: Box::new(store),
+            store,
             #[cfg(feature = "compat")]
             compat: Default::default(),
             #[cfg(feature = "compat")]
             compat_queue: Default::default(),
             batch: Vec::with_capacity(100),
+            tx,
+            rx,
         }
     }
 
@@ -214,44 +224,52 @@ impl<P: StoreParams> Bitswap<P> {
     }
 }
 
+fn start_request_thread<S: BitswapStore>(
+    store: Arc<S>,
+) -> (
+    mpsc::UnboundedSender<(BitswapChannel, BitswapRequest)>,
+    mpsc::UnboundedReceiver<(BitswapChannel, BitswapResponse)>,
+) {
+    let (tx, requests) = mpsc::unbounded();
+    let (responses, rx) = mpsc::unbounded();
+    std::thread::spawn(move || {
+        let mut requests: mpsc::UnboundedReceiver<(BitswapChannel, BitswapRequest)> = requests;
+        while let Some((channel, request)) = futures::executor::block_on(requests.next()) {
+            let response = match request.ty {
+                RequestType::Have => {
+                    let have = store.contains(&request.cid).ok().unwrap_or_default();
+                    if have {
+                        RESPONSES_TOTAL.with_label_values(&["have"]).inc();
+                    } else {
+                        RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
+                    }
+                    tracing::trace!("have {}", have);
+                    BitswapResponse::Have(have)
+                }
+                RequestType::Block => {
+                    let block = store.get(&request.cid).ok().unwrap_or_default();
+                    if let Some(data) = block {
+                        RESPONSES_TOTAL.with_label_values(&["block"]).inc();
+                        SENT_BLOCK_BYTES.inc_by(data.len() as u64);
+                        tracing::trace!("block {}", data.len());
+                        BitswapResponse::Block(data)
+                    } else {
+                        RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
+                        tracing::trace!("have false");
+                        BitswapResponse::Have(false)
+                    }
+                }
+            };
+            responses.unbounded_send((channel, response)).ok();
+        }
+    });
+    (tx, rx)
+}
+
 impl<P: StoreParams> Bitswap<P> {
     /// Processes an incoming bitswap request.
     fn inject_request(&mut self, channel: BitswapChannel, request: BitswapRequest) {
-        let response = match request.ty {
-            RequestType::Have => {
-                let have = self.store.contains(&request.cid).ok().unwrap_or_default();
-                if have {
-                    RESPONSES_TOTAL.with_label_values(&["have"]).inc();
-                } else {
-                    RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
-                }
-                tracing::trace!("have {}", have);
-                BitswapResponse::Have(have)
-            }
-            RequestType::Block => {
-                let block = self.store.get(&request.cid).ok().unwrap_or_default();
-                if let Some(data) = block {
-                    RESPONSES_TOTAL.with_label_values(&["block"]).inc();
-                    SENT_BLOCK_BYTES.inc_by(data.len() as u64);
-                    tracing::trace!("block {}", data.len());
-                    BitswapResponse::Block(data)
-                } else {
-                    RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
-                    tracing::trace!("have false");
-                    BitswapResponse::Have(false)
-                }
-            }
-        };
-        match channel {
-            BitswapChannel::Bitswap(channel) => {
-                self.inner.send_response(channel, response).ok();
-            }
-            #[cfg(feature = "compat")]
-            BitswapChannel::Compat(peer_id) => {
-                let msg = CompatMessage::Response(request.cid, response);
-                self.compat_queue.push_back((peer_id, msg));
-            }
-        }
+        self.tx.unbounded_send((channel, request)).ok();
     }
 
     /// Processes an incoming bitswap response.
@@ -619,6 +637,18 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                 } => {
                     self.inject_inbound_failure(&peer, request_id, &error);
                 }
+            }
+        }
+        while let Poll::Ready(Some((channel, response))) = Pin::new(&mut self.rx).poll_next(cx) {
+            match channel {
+                BitswapChannel::Bitswap(channel) => {
+                    self.inner.send_response(channel, response).ok();
+                }
+                _ => {} /*#[cfg(feature = "compat")]
+                        BitswapChannel::Compat(peer_id) => {
+                            let msg = CompatMessage::Response(request.cid, response);
+                            self.compat_queue.push_back((peer_id, msg));
+                        }*/
             }
         }
         #[cfg(feature = "compat")]
