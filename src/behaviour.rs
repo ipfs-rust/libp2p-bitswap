@@ -497,161 +497,175 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             Self::OutEvent,
         >,
     > {
-        while let Poll::Ready(Some(response)) = Pin::new(&mut self.db_rx).poll_next(cx) {
-            match response {
-                DbResponse::Bitswap(channel, response) => match channel {
-                    BitswapChannel::Bitswap(channel) => {
-                        self.inner.send_response(channel, response).ok();
+        let mut exit = false;
+        while !exit {
+            exit = true;
+            while let Poll::Ready(Some(response)) = Pin::new(&mut self.db_rx).poll_next(cx) {
+                exit = false;
+                match response {
+                    DbResponse::Bitswap(channel, response) => match channel {
+                        BitswapChannel::Bitswap(channel) => {
+                            self.inner.send_response(channel, response).ok();
+                        }
+                        #[cfg(feature = "compat")]
+                        BitswapChannel::Compat(peer_id, cid) => {
+                            let compat = CompatMessage::Response(cid, response);
+                            return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                                peer_id,
+                                handler: NotifyHandler::Any,
+                                event: EitherOutput::Second(compat),
+                            });
+                        }
+                    },
+                    DbResponse::MissingBlocks(id, res) => match res {
+                        Ok(missing) => {
+                            MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
+                            self.query_manager
+                                .inject_response(id, Response::MissingBlocks(missing));
+                        }
+                        Err(err) => {
+                            self.query_manager.cancel(id);
+                            let event = BitswapEvent::Complete(id, Err(err));
+                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                        }
+                    },
+                }
+            }
+            while let Some(query) = self.query_manager.next() {
+                exit = false;
+                match query {
+                    QueryEvent::Request(id, req) => match req {
+                        Request::Have(peer_id, cid) => {
+                            let req = BitswapRequest {
+                                ty: RequestType::Have,
+                                cid,
+                            };
+                            let rid = self.inner.send_request(&peer_id, req);
+                            self.requests.insert(BitswapId::Bitswap(rid), id);
+                        }
+                        Request::Block(peer_id, cid) => {
+                            let req = BitswapRequest {
+                                ty: RequestType::Block,
+                                cid,
+                            };
+                            let rid = self.inner.send_request(&peer_id, req);
+                            self.requests.insert(BitswapId::Bitswap(rid), id);
+                        }
+                        Request::Providers(cid) => {
+                            let event = BitswapEvent::Providers(id, cid);
+                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                        }
+                        Request::MissingBlocks(cid) => {
+                            self.db_tx
+                                .unbounded_send(DbRequest::MissingBlocks(id, cid))
+                                .ok();
+                        }
+                    },
+                    QueryEvent::Progress(id, missing) => {
+                        let event = BitswapEvent::Progress(id, missing);
+                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                     }
-                    #[cfg(feature = "compat")]
-                    BitswapChannel::Compat(peer_id, cid) => {
-                        let compat = CompatMessage::Response(cid, response);
-                        return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                    QueryEvent::Complete(id, res) => {
+                        if res.is_err() {
+                            BLOCK_NOT_FOUND.inc();
+                        }
+                        let event = BitswapEvent::Complete(
+                            id,
+                            res.map_err(|cid| BlockNotFound(cid).into()),
+                        );
+                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                    }
+                }
+            }
+            while let Poll::Ready(event) = self.inner.poll(cx, pp) {
+                exit = false;
+                let event = match event {
+                    NetworkBehaviourAction::GenerateEvent(event) => event,
+                    NetworkBehaviourAction::DialAddress { address } => {
+                        return Poll::Ready(NetworkBehaviourAction::DialAddress { address });
+                    }
+                    NetworkBehaviourAction::DialPeer { peer_id, condition } => {
+                        return Poll::Ready(NetworkBehaviourAction::DialPeer {
                             peer_id,
-                            handler: NotifyHandler::Any,
-                            event: EitherOutput::Second(compat),
+                            condition,
                         });
                     }
-                },
-                DbResponse::MissingBlocks(id, res) => match res {
-                    Ok(missing) => {
-                        MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
-                        self.query_manager
-                            .inject_response(id, Response::MissingBlocks(missing));
-                    }
-                    Err(err) => {
-                        self.query_manager.cancel(id);
-                        let event = BitswapEvent::Complete(id, Err(err));
-                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                    }
-                },
-            }
-        }
-        loop {
-            let event = match self.inner.poll(cx, pp) {
-                Poll::Ready(NetworkBehaviourAction::GenerateEvent(event)) => event,
-                Poll::Ready(NetworkBehaviourAction::DialAddress { address }) => {
-                    return Poll::Ready(NetworkBehaviourAction::DialAddress { address });
-                }
-                Poll::Ready(NetworkBehaviourAction::DialPeer { peer_id, condition }) => {
-                    return Poll::Ready(NetworkBehaviourAction::DialPeer { peer_id, condition });
-                }
-                Poll::Ready(NetworkBehaviourAction::NotifyHandler {
-                    peer_id,
-                    handler,
-                    event,
-                }) => {
-                    return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                    NetworkBehaviourAction::NotifyHandler {
                         peer_id,
                         handler,
-                        #[cfg(not(feature = "compat"))]
                         event,
-                        #[cfg(feature = "compat")]
-                        event: EitherOutput::First(event),
-                    });
-                }
-                Poll::Ready(NetworkBehaviourAction::ReportObservedAddr { address, score }) => {
-                    return Poll::Ready(NetworkBehaviourAction::ReportObservedAddr {
-                        address,
-                        score,
-                    });
-                }
-                Poll::Pending => break,
-            };
-            match event {
-                RequestResponseEvent::Message { peer, message } => match message {
-                    RequestResponseMessage::Request {
-                        request_id: _,
-                        request,
-                        channel,
-                    } => self.inject_request(BitswapChannel::Bitswap(channel), request),
-                    RequestResponseMessage::Response {
+                    } => {
+                        return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                            peer_id,
+                            handler,
+                            #[cfg(not(feature = "compat"))]
+                            event,
+                            #[cfg(feature = "compat")]
+                            event: EitherOutput::First(event),
+                        });
+                    }
+                    NetworkBehaviourAction::ReportObservedAddr { address, score } => {
+                        return Poll::Ready(NetworkBehaviourAction::ReportObservedAddr {
+                            address,
+                            score,
+                        });
+                    }
+                };
+                match event {
+                    RequestResponseEvent::Message { peer, message } => match message {
+                        RequestResponseMessage::Request {
+                            request_id: _,
+                            request,
+                            channel,
+                        } => self.inject_request(BitswapChannel::Bitswap(channel), request),
+                        RequestResponseMessage::Response {
+                            request_id,
+                            response,
+                        } => self.inject_response(BitswapId::Bitswap(request_id), peer, response),
+                    },
+                    RequestResponseEvent::ResponseSent { .. } => {}
+                    RequestResponseEvent::OutboundFailure {
+                        peer,
                         request_id,
-                        response,
-                    } => self.inject_response(BitswapId::Bitswap(request_id), peer, response),
-                },
-                RequestResponseEvent::ResponseSent { .. } => {}
-                RequestResponseEvent::OutboundFailure {
-                    peer,
-                    request_id,
-                    error,
-                } => {
-                    self.inject_outbound_failure(&peer, request_id, &error);
-                    #[cfg(feature = "compat")]
-                    if let OutboundFailure::UnsupportedProtocols = error {
-                        if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id)) {
-                            if let Some(info) = self.query_manager.query_info(id) {
-                                let ty = match info.label {
-                                    "have" => RequestType::Have,
-                                    "block" => RequestType::Block,
-                                    _ => unreachable!(),
-                                };
-                                let request = BitswapRequest { ty, cid: info.cid };
-                                self.requests.insert(BitswapId::Compat(info.cid), id);
-                                tracing::trace!("adding compat peer {}", peer);
-                                self.compat.insert(peer);
-                                return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
-                                    peer_id: peer,
-                                    handler: NotifyHandler::Any,
-                                    event: EitherOutput::Second(CompatMessage::Request(request)),
-                                });
+                        error,
+                    } => {
+                        self.inject_outbound_failure(&peer, request_id, &error);
+                        #[cfg(feature = "compat")]
+                        if let OutboundFailure::UnsupportedProtocols = error {
+                            if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id))
+                            {
+                                if let Some(info) = self.query_manager.query_info(id) {
+                                    let ty = match info.label {
+                                        "have" => RequestType::Have,
+                                        "block" => RequestType::Block,
+                                        _ => unreachable!(),
+                                    };
+                                    let request = BitswapRequest { ty, cid: info.cid };
+                                    self.requests.insert(BitswapId::Compat(info.cid), id);
+                                    tracing::trace!("adding compat peer {}", peer);
+                                    self.compat.insert(peer);
+                                    return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                                        peer_id: peer,
+                                        handler: NotifyHandler::Any,
+                                        event: EitherOutput::Second(CompatMessage::Request(
+                                            request,
+                                        )),
+                                    });
+                                }
                             }
                         }
+                        if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id)) {
+                            self.query_manager
+                                .inject_response(id, Response::Have(peer, false));
+                        }
                     }
-                    if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id)) {
-                        self.query_manager
-                            .inject_response(id, Response::Have(peer, false));
+                    RequestResponseEvent::InboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                    } => {
+                        self.inject_inbound_failure(&peer, request_id, &error);
                     }
-                }
-                RequestResponseEvent::InboundFailure {
-                    peer,
-                    request_id,
-                    error,
-                } => {
-                    self.inject_inbound_failure(&peer, request_id, &error);
-                }
-            }
-        }
-        while let Some(query) = self.query_manager.next() {
-            match query {
-                QueryEvent::Request(id, req) => match req {
-                    Request::Have(peer_id, cid) => {
-                        let req = BitswapRequest {
-                            ty: RequestType::Have,
-                            cid,
-                        };
-                        let rid = self.inner.send_request(&peer_id, req);
-                        self.requests.insert(BitswapId::Bitswap(rid), id);
-                    }
-                    Request::Block(peer_id, cid) => {
-                        let req = BitswapRequest {
-                            ty: RequestType::Block,
-                            cid,
-                        };
-                        let rid = self.inner.send_request(&peer_id, req);
-                        self.requests.insert(BitswapId::Bitswap(rid), id);
-                    }
-                    Request::Providers(cid) => {
-                        let event = BitswapEvent::Providers(id, cid);
-                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                    }
-                    Request::MissingBlocks(cid) => {
-                        self.db_tx
-                            .unbounded_send(DbRequest::MissingBlocks(id, cid))
-                            .ok();
-                    }
-                },
-                QueryEvent::Progress(id, missing) => {
-                    let event = BitswapEvent::Progress(id, missing);
-                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                }
-                QueryEvent::Complete(id, res) => {
-                    if res.is_err() {
-                        BLOCK_NOT_FOUND.inc();
-                    }
-                    let event =
-                        BitswapEvent::Complete(id, res.map_err(|cid| BlockNotFound(cid).into()));
-                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                 }
             }
         }
