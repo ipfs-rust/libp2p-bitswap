@@ -15,6 +15,8 @@ use crate::stats::*;
 use fnv::FnvHashMap;
 #[cfg(feature = "compat")]
 use fnv::FnvHashSet;
+use futures::channel::mpsc;
+use futures::stream::{Stream, StreamExt};
 use futures::task::{Context, Poll};
 use libipld::error::BlockNotFound;
 use libipld::store::StoreParams;
@@ -24,17 +26,15 @@ use libp2p::core::connection::{ConnectionId, ListenerId};
 use libp2p::core::either::EitherOutput;
 use libp2p::core::{ConnectedPoint, Multiaddr, PeerId};
 use libp2p::request_response::{
-    throttled::{Event as ThrottledEvent, ResponseChannel, Throttled},
-    InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponseConfig,
-    RequestResponseEvent, RequestResponseMessage,
+    InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse,
+    RequestResponseConfig, RequestResponseEvent, RequestResponseMessage, ResponseChannel,
 };
 use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters, ProtocolsHandler};
 #[cfg(feature = "compat")]
 use libp2p::swarm::{NotifyHandler, OneShotHandler, ProtocolsHandlerSelect};
 use prometheus::Registry;
-use std::collections::VecDeque;
 use std::error::Error;
-use std::num::NonZeroU16;
+use std::pin::Pin;
 use std::time::Duration;
 
 /// Bitswap response channel.
@@ -76,8 +76,6 @@ pub struct BitswapConfig {
     pub request_timeout: Duration,
     /// Time a connection is kept alive.
     pub connection_keep_alive: Duration,
-    /// The number of concurrent requests per peer.
-    pub receive_limit: NonZeroU16,
 }
 
 impl BitswapConfig {
@@ -86,7 +84,6 @@ impl BitswapConfig {
         Self {
             request_timeout: Duration::from_secs(10),
             connection_keep_alive: Duration::from_secs(10),
-            receive_limit: NonZeroU16::new(20).expect("20 > 0"),
         }
     }
 }
@@ -107,27 +104,24 @@ enum BitswapId {
 enum BitswapChannel {
     Bitswap(Channel),
     #[cfg(feature = "compat")]
-    Compat(PeerId),
+    Compat(PeerId, Cid),
 }
 
 /// Network behaviour that handles sending and receiving blocks.
 pub struct Bitswap<P: StoreParams> {
     /// Inner behaviour.
-    inner: Throttled<BitswapCodec<P>>,
+    inner: RequestResponse<BitswapCodec<P>>,
     /// Query manager.
     query_manager: QueryManager,
-    /// Pending requests.
-    pending_requests: VecDeque<(QueryId, PeerId, BitswapRequest)>,
     /// Requests.
     requests: FnvHashMap<BitswapId, QueryId>,
-    /// Bitswap store.
-    store: Box<dyn BitswapStore<Params = P>>,
+    /// Db request channel.
+    db_tx: mpsc::UnboundedSender<DbRequest<P>>,
+    /// Db response channel.
+    db_rx: mpsc::UnboundedReceiver<DbResponse>,
     /// Compat peers.
     #[cfg(feature = "compat")]
     compat: FnvHashSet<PeerId>,
-    /// Compat queue.
-    #[cfg(feature = "compat")]
-    compat_queue: VecDeque<(PeerId, CompatMessage)>,
 }
 
 impl<P: StoreParams> Bitswap<P> {
@@ -137,18 +131,16 @@ impl<P: StoreParams> Bitswap<P> {
         rr_config.set_connection_keep_alive(config.connection_keep_alive);
         rr_config.set_request_timeout(config.request_timeout);
         let protocols = std::iter::once((BitswapProtocol, ProtocolSupport::Full));
-        let mut inner = Throttled::new(BitswapCodec::<P>::default(), protocols, rr_config);
-        inner.set_receive_limit(config.receive_limit);
+        let inner = RequestResponse::new(BitswapCodec::<P>::default(), protocols, rr_config);
+        let (db_tx, db_rx) = start_db_thread(store);
         Self {
             inner,
             query_manager: Default::default(),
-            pending_requests: Default::default(),
             requests: Default::default(),
-            store: Box::new(store),
+            db_tx,
+            db_rx,
             #[cfg(feature = "compat")]
             compat: Default::default(),
-            #[cfg(feature = "compat")]
-            compat_queue: Default::default(),
         }
     }
 
@@ -208,53 +200,86 @@ impl<P: StoreParams> Bitswap<P> {
     }
 }
 
+enum DbRequest<P: StoreParams> {
+    Bitswap(BitswapChannel, BitswapRequest),
+    Insert(Block<P>),
+    MissingBlocks(QueryId, Cid),
+}
+
+enum DbResponse {
+    Bitswap(BitswapChannel, BitswapResponse),
+    MissingBlocks(QueryId, Result<Vec<Cid>>),
+}
+
+fn start_db_thread<S: BitswapStore>(
+    mut store: S,
+) -> (
+    mpsc::UnboundedSender<DbRequest<S::Params>>,
+    mpsc::UnboundedReceiver<DbResponse>,
+) {
+    let (tx, requests) = mpsc::unbounded();
+    let (responses, rx) = mpsc::unbounded();
+    std::thread::spawn(move || {
+        let mut requests: mpsc::UnboundedReceiver<DbRequest<S::Params>> = requests;
+        while let Some(request) = futures::executor::block_on(requests.next()) {
+            match request {
+                DbRequest::Bitswap(channel, request) => {
+                    let response = match request.ty {
+                        RequestType::Have => {
+                            let have = store.contains(&request.cid).ok().unwrap_or_default();
+                            if have {
+                                RESPONSES_TOTAL.with_label_values(&["have"]).inc();
+                            } else {
+                                RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
+                            }
+                            tracing::trace!("have {}", have);
+                            BitswapResponse::Have(have)
+                        }
+                        RequestType::Block => {
+                            let block = store.get(&request.cid).ok().unwrap_or_default();
+                            if let Some(data) = block {
+                                RESPONSES_TOTAL.with_label_values(&["block"]).inc();
+                                SENT_BLOCK_BYTES.inc_by(data.len() as u64);
+                                tracing::trace!("block {}", data.len());
+                                BitswapResponse::Block(data)
+                            } else {
+                                RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
+                                tracing::trace!("have false");
+                                BitswapResponse::Have(false)
+                            }
+                        }
+                    };
+                    responses
+                        .unbounded_send(DbResponse::Bitswap(channel, response))
+                        .ok();
+                }
+                DbRequest::Insert(block) => {
+                    if let Err(err) = store.insert(&block) {
+                        tracing::error!("error inserting blocks {}", err);
+                    }
+                }
+                DbRequest::MissingBlocks(id, cid) => {
+                    let res = store.missing_blocks(&cid);
+                    responses
+                        .unbounded_send(DbResponse::MissingBlocks(id, res))
+                        .ok();
+                }
+            }
+        }
+    });
+    (tx, rx)
+}
+
 impl<P: StoreParams> Bitswap<P> {
     /// Processes an incoming bitswap request.
     fn inject_request(&mut self, channel: BitswapChannel, request: BitswapRequest) {
-        let response = match request.ty {
-            RequestType::Have => {
-                let have = self.store.contains(&request.cid).ok().unwrap_or_default();
-                if have {
-                    RESPONSES_TOTAL.with_label_values(&["have"]).inc();
-                } else {
-                    RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
-                }
-                tracing::trace!("have {}", have);
-                BitswapResponse::Have(have)
-            }
-            RequestType::Block => {
-                let block = self.store.get(&request.cid).ok().unwrap_or_default();
-                if let Some(data) = block {
-                    RESPONSES_TOTAL.with_label_values(&["block"]).inc();
-                    SENT_BLOCK_BYTES.inc_by(data.len() as u64);
-                    tracing::trace!("block {}", data.len());
-                    BitswapResponse::Block(data)
-                } else {
-                    RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
-                    tracing::trace!("have false");
-                    BitswapResponse::Have(false)
-                }
-            }
-        };
-        match channel {
-            BitswapChannel::Bitswap(channel) => {
-                self.inner.send_response(channel, response).ok();
-            }
-            #[cfg(feature = "compat")]
-            BitswapChannel::Compat(peer_id) => {
-                let msg = CompatMessage::Response(request.cid, response);
-                self.compat_queue.push_back((peer_id, msg));
-            }
-        }
+        self.db_tx
+            .unbounded_send(DbRequest::Bitswap(channel, request))
+            .ok();
     }
 
     /// Processes an incoming bitswap response.
-    fn inject_response(
-        &mut self,
-        id: BitswapId,
-        peer: PeerId,
-        response: BitswapResponse,
-    ) -> Option<BitswapEvent> {
+    fn inject_response(&mut self, id: BitswapId, peer: PeerId, response: BitswapResponse) {
         if let Some(id) = self.requests.remove(&id) {
             match response {
                 BitswapResponse::Have(have) => {
@@ -266,13 +291,9 @@ impl<P: StoreParams> Bitswap<P> {
                         let len = data.len();
                         if let Ok(block) = Block::new(info.cid, data) {
                             RECEIVED_BLOCK_BYTES.inc_by(len as u64);
-                            if let Err(err) = self.store.insert(&block) {
-                                self.query_manager.cancel(id);
-                                return Some(BitswapEvent::Complete(id, Err(err)));
-                            } else {
-                                self.query_manager
-                                    .inject_response(id, Response::Block(peer, true));
-                            }
+                            self.db_tx.unbounded_send(DbRequest::Insert(block)).ok();
+                            self.query_manager
+                                .inject_response(id, Response::Block(peer, true));
                         } else {
                             tracing::trace!("received invalid block");
                             RECEIVED_INVALID_BLOCK_BYTES.inc_by(len as u64);
@@ -283,18 +304,84 @@ impl<P: StoreParams> Bitswap<P> {
                 }
             }
         }
-        None
+    }
+
+    fn inject_outbound_failure(
+        &mut self,
+        peer: &PeerId,
+        request_id: RequestId,
+        error: &OutboundFailure,
+    ) {
+        tracing::trace!(
+            "bitswap outbound failure {} {} {:?}",
+            peer,
+            request_id,
+            error
+        );
+        match error {
+            OutboundFailure::DialFailure => {
+                OUTBOUND_FAILURE.with_label_values(&["dial_failure"]).inc();
+            }
+            OutboundFailure::Timeout => {
+                OUTBOUND_FAILURE.with_label_values(&["timeout"]).inc();
+            }
+            OutboundFailure::ConnectionClosed => {
+                OUTBOUND_FAILURE
+                    .with_label_values(&["connection_closed"])
+                    .inc();
+            }
+            OutboundFailure::UnsupportedProtocols => {
+                OUTBOUND_FAILURE
+                    .with_label_values(&["unsupported_protocols"])
+                    .inc();
+            }
+        }
+    }
+
+    fn inject_inbound_failure(
+        &mut self,
+        peer: &PeerId,
+        request_id: RequestId,
+        error: &InboundFailure,
+    ) {
+        tracing::trace!(
+            "bitswap inbound failure {} {} {:?}",
+            peer,
+            request_id,
+            error
+        );
+        match error {
+            InboundFailure::Timeout => {
+                INBOUND_FAILURE.with_label_values(&["timeout"]).inc();
+            }
+            InboundFailure::ConnectionClosed => {
+                INBOUND_FAILURE
+                    .with_label_values(&["connection_closed"])
+                    .inc();
+            }
+            InboundFailure::UnsupportedProtocols => {
+                INBOUND_FAILURE
+                    .with_label_values(&["unsupported_protocols"])
+                    .inc();
+            }
+            InboundFailure::ResponseOmission => {
+                INBOUND_FAILURE
+                    .with_label_values(&["response_omission"])
+                    .inc();
+            }
+        }
     }
 }
 
 impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     #[cfg(not(feature = "compat"))]
-    type ProtocolsHandler = <Throttled<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler;
+    type ProtocolsHandler =
+        <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler;
 
     #[cfg(feature = "compat")]
     #[allow(clippy::type_complexity)]
     type ProtocolsHandler = ProtocolsHandlerSelect<
-        <Throttled<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler,
+        <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler,
         OneShotHandler<CompatProtocol, CompatMessage, InboundMessage>,
     >;
     type OutEvent = BitswapEvent;
@@ -388,12 +475,11 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     match msg {
                         CompatMessage::Request(req) => {
                             tracing::trace!("received compat request");
-                            self.inject_request(BitswapChannel::Compat(peer_id), req);
+                            self.inject_request(BitswapChannel::Compat(peer_id, req.cid), req);
                         }
                         CompatMessage::Response(cid, res) => {
                             tracing::trace!("received compat response");
                             self.inject_response(BitswapId::Compat(cid), peer_id, res);
-                            // TODO ignores complete error if insert failed
                         }
                     }
                 }
@@ -411,28 +497,27 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             Self::OutEvent,
         >,
     > {
-        while let Some(query) = self.query_manager.next() {
-            match query {
-                QueryEvent::Request(id, req) => match req {
-                    Request::Have(peer_id, cid) => {
-                        let req = BitswapRequest {
-                            ty: RequestType::Have,
-                            cid,
-                        };
-                        self.pending_requests.push_back((id, peer_id, req));
-                    }
-                    Request::Block(peer_id, cid) => {
-                        let req = BitswapRequest {
-                            ty: RequestType::Block,
-                            cid,
-                        };
-                        self.pending_requests.push_back((id, peer_id, req));
-                    }
-                    Request::Providers(cid) => {
-                        let event = BitswapEvent::Providers(id, cid);
-                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                    }
-                    Request::MissingBlocks(cid) => match self.store.missing_blocks(&cid) {
+        let mut exit = false;
+        while !exit {
+            exit = true;
+            while let Poll::Ready(Some(response)) = Pin::new(&mut self.db_rx).poll_next(cx) {
+                exit = false;
+                match response {
+                    DbResponse::Bitswap(channel, response) => match channel {
+                        BitswapChannel::Bitswap(channel) => {
+                            self.inner.send_response(channel, response).ok();
+                        }
+                        #[cfg(feature = "compat")]
+                        BitswapChannel::Compat(peer_id, cid) => {
+                            let compat = CompatMessage::Response(cid, response);
+                            return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                                peer_id,
+                                handler: NotifyHandler::Any,
+                                event: EitherOutput::Second(compat),
+                            });
+                        }
+                    },
+                    DbResponse::MissingBlocks(id, res) => match res {
                         Ok(missing) => {
                             MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
                             self.query_manager
@@ -444,136 +529,109 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                         }
                     },
-                },
-                QueryEvent::Progress(id, missing) => {
-                    let event = BitswapEvent::Progress(id, missing);
-                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                }
-                QueryEvent::Complete(id, res) => {
-                    if res.is_err() {
-                        BLOCK_NOT_FOUND.inc();
-                    }
-                    let event =
-                        BitswapEvent::Complete(id, res.map_err(|cid| BlockNotFound(cid).into()));
-                    return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                 }
             }
-        }
-        loop {
-            for _ in 0..self.pending_requests.len() {
-                if let Some((qid, peer, request)) = self.pending_requests.pop_front() {
-                    #[cfg(feature = "compat")]
-                    if self.compat.contains(&peer) {
-                        tracing::trace!("sending compat request");
-                        if let Some(info) = self.query_manager.query_info(qid) {
-                            self.requests.insert(BitswapId::Compat(info.cid), qid);
-                            return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
-                                peer_id: peer,
-                                handler: NotifyHandler::Any,
-                                event: EitherOutput::Second(CompatMessage::Request(request)),
-                            });
+            while let Some(query) = self.query_manager.next() {
+                exit = false;
+                match query {
+                    QueryEvent::Request(id, req) => match req {
+                        Request::Have(peer_id, cid) => {
+                            let req = BitswapRequest {
+                                ty: RequestType::Have,
+                                cid,
+                            };
+                            let rid = self.inner.send_request(&peer_id, req);
+                            self.requests.insert(BitswapId::Bitswap(rid), id);
                         }
-                    }
-                    match self.inner.send_request(&peer, request) {
-                        Ok(rid) => {
-                            self.requests.insert(BitswapId::Bitswap(rid), qid);
+                        Request::Block(peer_id, cid) => {
+                            let req = BitswapRequest {
+                                ty: RequestType::Block,
+                                cid,
+                            };
+                            let rid = self.inner.send_request(&peer_id, req);
+                            self.requests.insert(BitswapId::Bitswap(rid), id);
                         }
-                        Err(request) => {
-                            self.pending_requests.push_back((qid, peer, request));
-                        }
-                    }
-                }
-            }
-            let event = match self.inner.poll(cx, pp) {
-                Poll::Ready(NetworkBehaviourAction::GenerateEvent(event)) => event,
-                Poll::Ready(NetworkBehaviourAction::DialAddress { address }) => {
-                    return Poll::Ready(NetworkBehaviourAction::DialAddress { address });
-                }
-                Poll::Ready(NetworkBehaviourAction::DialPeer { peer_id, condition }) => {
-                    return Poll::Ready(NetworkBehaviourAction::DialPeer { peer_id, condition });
-                }
-                Poll::Ready(NetworkBehaviourAction::NotifyHandler {
-                    peer_id,
-                    handler,
-                    event,
-                }) => {
-                    return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
-                        peer_id,
-                        handler,
-                        #[cfg(not(feature = "compat"))]
-                        event,
-                        #[cfg(feature = "compat")]
-                        event: EitherOutput::First(event),
-                    });
-                }
-                Poll::Ready(NetworkBehaviourAction::ReportObservedAddr { address, score }) => {
-                    return Poll::Ready(NetworkBehaviourAction::ReportObservedAddr {
-                        address,
-                        score,
-                    });
-                }
-                Poll::Pending => break,
-            };
-            let event = match event {
-                ThrottledEvent::Event(event) => event,
-                ThrottledEvent::ResumeSending(peer_id) => {
-                    THROTTLED_OUTBOUND.inc();
-                    tracing::trace!("resume sending {}", peer_id);
-                    continue;
-                }
-                ThrottledEvent::TooManyInboundRequests(peer_id) => {
-                    THROTTLED_INBOUND.inc();
-                    tracing::trace!("too many inbound requests from {}", peer_id);
-                    continue;
-                }
-            };
-            match event {
-                RequestResponseEvent::Message { peer, message } => match message {
-                    RequestResponseMessage::Request {
-                        request_id: _,
-                        request,
-                        channel,
-                    } => self.inject_request(BitswapChannel::Bitswap(channel), request),
-                    RequestResponseMessage::Response {
-                        request_id,
-                        response,
-                    } => {
-                        if let Some(event) =
-                            self.inject_response(BitswapId::Bitswap(request_id), peer, response)
-                        {
+                        Request::Providers(cid) => {
+                            let event = BitswapEvent::Providers(id, cid);
                             return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                         }
+                        Request::MissingBlocks(cid) => {
+                            self.db_tx
+                                .unbounded_send(DbRequest::MissingBlocks(id, cid))
+                                .ok();
+                        }
+                    },
+                    QueryEvent::Progress(id, missing) => {
+                        let event = BitswapEvent::Progress(id, missing);
+                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                     }
-                },
-                RequestResponseEvent::ResponseSent { .. } => {}
-                RequestResponseEvent::OutboundFailure {
-                    peer,
-                    request_id,
-                    error,
-                } => {
-                    tracing::trace!(
-                        "bitswap outbound failure {} {} {:?}",
+                    QueryEvent::Complete(id, res) => {
+                        if res.is_err() {
+                            BLOCK_NOT_FOUND.inc();
+                        }
+                        let event = BitswapEvent::Complete(
+                            id,
+                            res.map_err(|cid| BlockNotFound(cid).into()),
+                        );
+                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                    }
+                }
+            }
+            while let Poll::Ready(event) = self.inner.poll(cx, pp) {
+                exit = false;
+                let event = match event {
+                    NetworkBehaviourAction::GenerateEvent(event) => event,
+                    NetworkBehaviourAction::DialAddress { address } => {
+                        return Poll::Ready(NetworkBehaviourAction::DialAddress { address });
+                    }
+                    NetworkBehaviourAction::DialPeer { peer_id, condition } => {
+                        return Poll::Ready(NetworkBehaviourAction::DialPeer {
+                            peer_id,
+                            condition,
+                        });
+                    }
+                    NetworkBehaviourAction::NotifyHandler {
+                        peer_id,
+                        handler,
+                        event,
+                    } => {
+                        return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                            peer_id,
+                            handler,
+                            #[cfg(not(feature = "compat"))]
+                            event,
+                            #[cfg(feature = "compat")]
+                            event: EitherOutput::First(event),
+                        });
+                    }
+                    NetworkBehaviourAction::ReportObservedAddr { address, score } => {
+                        return Poll::Ready(NetworkBehaviourAction::ReportObservedAddr {
+                            address,
+                            score,
+                        });
+                    }
+                };
+                match event {
+                    RequestResponseEvent::Message { peer, message } => match message {
+                        RequestResponseMessage::Request {
+                            request_id: _,
+                            request,
+                            channel,
+                        } => self.inject_request(BitswapChannel::Bitswap(channel), request),
+                        RequestResponseMessage::Response {
+                            request_id,
+                            response,
+                        } => self.inject_response(BitswapId::Bitswap(request_id), peer, response),
+                    },
+                    RequestResponseEvent::ResponseSent { .. } => {}
+                    RequestResponseEvent::OutboundFailure {
                         peer,
                         request_id,
-                        error
-                    );
-                    match error {
-                        OutboundFailure::DialFailure => {
-                            OUTBOUND_FAILURE.with_label_values(&["dial_failure"]).inc();
-                        }
-                        OutboundFailure::Timeout => {
-                            OUTBOUND_FAILURE.with_label_values(&["timeout"]).inc();
-                        }
-                        OutboundFailure::ConnectionClosed => {
-                            OUTBOUND_FAILURE
-                                .with_label_values(&["connection_closed"])
-                                .inc();
-                        }
-                        OutboundFailure::UnsupportedProtocols => {
-                            OUTBOUND_FAILURE
-                                .with_label_values(&["unsupported_protocols"])
-                                .inc();
-                            #[cfg(feature = "compat")]
+                        error,
+                    } => {
+                        self.inject_outbound_failure(&peer, request_id, &error);
+                        #[cfg(feature = "compat")]
+                        if let OutboundFailure::UnsupportedProtocols = error {
                             if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id))
                             {
                                 if let Some(info) = self.query_manager.query_info(id) {
@@ -583,60 +641,33 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                         _ => unreachable!(),
                                     };
                                     let request = BitswapRequest { ty, cid: info.cid };
-                                    self.pending_requests.push_back((id, peer, request));
-
+                                    self.requests.insert(BitswapId::Compat(info.cid), id);
                                     tracing::trace!("adding compat peer {}", peer);
                                     self.compat.insert(peer);
+                                    return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                                        peer_id: peer,
+                                        handler: NotifyHandler::Any,
+                                        event: EitherOutput::Second(CompatMessage::Request(
+                                            request,
+                                        )),
+                                    });
                                 }
                             }
                         }
+                        if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id)) {
+                            self.query_manager
+                                .inject_response(id, Response::Have(peer, false));
+                        }
                     }
-                    if let Some(id) = self.requests.remove(&BitswapId::Bitswap(request_id)) {
-                        self.query_manager
-                            .inject_response(id, Response::Have(peer, false));
-                    }
-                }
-                RequestResponseEvent::InboundFailure {
-                    peer,
-                    request_id,
-                    error,
-                } => {
-                    tracing::trace!(
-                        "bitswap inbound failure {} {} {:?}",
+                    RequestResponseEvent::InboundFailure {
                         peer,
                         request_id,
-                        error
-                    );
-                    match error {
-                        InboundFailure::Timeout => {
-                            INBOUND_FAILURE.with_label_values(&["timeout"]).inc();
-                        }
-                        InboundFailure::ConnectionClosed => {
-                            INBOUND_FAILURE
-                                .with_label_values(&["connection_closed"])
-                                .inc();
-                        }
-                        InboundFailure::UnsupportedProtocols => {
-                            INBOUND_FAILURE
-                                .with_label_values(&["unsupported_protocols"])
-                                .inc();
-                        }
-                        InboundFailure::ResponseOmission => {
-                            INBOUND_FAILURE
-                                .with_label_values(&["response_omission"])
-                                .inc();
-                        }
+                        error,
+                    } => {
+                        self.inject_inbound_failure(&peer, request_id, &error);
                     }
                 }
             }
-        }
-        #[cfg(feature = "compat")]
-        if let Some((peer_id, compat)) = self.compat_queue.pop_front() {
-            return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
-                peer_id,
-                handler: NotifyHandler::Any,
-                event: EitherOutput::Second(compat),
-            });
         }
         Poll::Pending
     }
@@ -712,14 +743,17 @@ mod tests {
             Ok(())
         }
         fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>> {
-            if let Some(data) = self.get(cid)? {
-                let block = Block::<Self::Params>::new_unchecked(*cid, data);
-                let mut refs = vec![];
-                block.references(&mut refs)?;
-                Ok(refs)
-            } else {
-                panic!("missing_blocks called before insert");
+            let mut stack = vec![*cid];
+            let mut missing = vec![];
+            while let Some(cid) = stack.pop() {
+                if let Some(data) = self.get(&cid)? {
+                    let block = Block::<Self::Params>::new_unchecked(cid, data);
+                    block.references(&mut stack)?;
+                } else {
+                    missing.push(cid);
+                }
             }
+            Ok(missing)
         }
     }
 
