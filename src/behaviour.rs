@@ -35,7 +35,6 @@ use libp2p::swarm::{NotifyHandler, OneShotHandler, ProtocolsHandlerSelect};
 use prometheus::Registry;
 use std::error::Error;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Bitswap response channel.
@@ -66,13 +65,6 @@ pub trait BitswapStore: Send + Sync + 'static {
     fn get(&self, cid: &Cid) -> Result<Option<Vec<u8>>>;
     /// A block response needs to insert the block into the store.
     fn insert(&self, block: &Block<Self::Params>) -> Result<()>;
-    /// A block response needs to insert the block into the store.
-    fn insert_many(&self, blocks: &[Block<Self::Params>]) -> Result<()> {
-        for block in blocks {
-            self.insert(block)?;
-        }
-        Ok(())
-    }
     /// A sync query needs a list of missing blocks to make progress.
     fn missing_blocks(&self, cid: &Cid) -> Result<Vec<Cid>>;
 }
@@ -123,15 +115,13 @@ pub struct Bitswap<P: StoreParams> {
     query_manager: QueryManager,
     /// Requests.
     requests: FnvHashMap<BitswapId, QueryId>,
-    /// Bitswap store.
-    store: Arc<dyn BitswapStore<Params = P>>,
+    /// Db request channel.
+    db_tx: mpsc::UnboundedSender<DbRequest<P>>,
+    /// Db response channel.
+    db_rx: mpsc::UnboundedReceiver<DbResponse>,
     /// Compat peers.
     #[cfg(feature = "compat")]
     compat: FnvHashSet<PeerId>,
-    /// Insert batch.
-    batch: Vec<Block<P>>,
-    tx: mpsc::UnboundedSender<(BitswapChannel, BitswapRequest)>,
-    rx: mpsc::UnboundedReceiver<(BitswapChannel, BitswapResponse)>,
 }
 
 impl<P: StoreParams> Bitswap<P> {
@@ -142,18 +132,15 @@ impl<P: StoreParams> Bitswap<P> {
         rr_config.set_request_timeout(config.request_timeout);
         let protocols = std::iter::once((BitswapProtocol, ProtocolSupport::Full));
         let inner = RequestResponse::new(BitswapCodec::<P>::default(), protocols, rr_config);
-        let store = Arc::new(store);
-        let (tx, rx) = start_request_thread(store.clone());
+        let (db_tx, db_rx) = start_db_thread(store);
         Self {
             inner,
             query_manager: Default::default(),
             requests: Default::default(),
-            store,
+            db_tx,
+            db_rx,
             #[cfg(feature = "compat")]
             compat: Default::default(),
-            batch: Vec::with_capacity(100),
-            tx,
-            rx,
         }
     }
 
@@ -213,43 +200,71 @@ impl<P: StoreParams> Bitswap<P> {
     }
 }
 
-fn start_request_thread<S: BitswapStore>(
-    store: Arc<S>,
+enum DbRequest<P: StoreParams> {
+    Bitswap(BitswapChannel, BitswapRequest),
+    Insert(Block<P>),
+    MissingBlocks(QueryId, Cid),
+}
+
+enum DbResponse {
+    Bitswap(BitswapChannel, BitswapResponse),
+    MissingBlocks(QueryId, Result<Vec<Cid>>),
+}
+
+fn start_db_thread<S: BitswapStore>(
+    store: S,
 ) -> (
-    mpsc::UnboundedSender<(BitswapChannel, BitswapRequest)>,
-    mpsc::UnboundedReceiver<(BitswapChannel, BitswapResponse)>,
+    mpsc::UnboundedSender<DbRequest<S::Params>>,
+    mpsc::UnboundedReceiver<DbResponse>,
 ) {
     let (tx, requests) = mpsc::unbounded();
     let (responses, rx) = mpsc::unbounded();
     std::thread::spawn(move || {
-        let mut requests: mpsc::UnboundedReceiver<(BitswapChannel, BitswapRequest)> = requests;
-        while let Some((channel, request)) = futures::executor::block_on(requests.next()) {
-            let response = match request.ty {
-                RequestType::Have => {
-                    let have = store.contains(&request.cid).ok().unwrap_or_default();
-                    if have {
-                        RESPONSES_TOTAL.with_label_values(&["have"]).inc();
-                    } else {
-                        RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
-                    }
-                    tracing::trace!("have {}", have);
-                    BitswapResponse::Have(have)
+        let mut requests: mpsc::UnboundedReceiver<DbRequest<S::Params>> = requests;
+        while let Some(request) = futures::executor::block_on(requests.next()) {
+            match request {
+                DbRequest::Bitswap(channel, request) => {
+                    let response = match request.ty {
+                        RequestType::Have => {
+                            let have = store.contains(&request.cid).ok().unwrap_or_default();
+                            if have {
+                                RESPONSES_TOTAL.with_label_values(&["have"]).inc();
+                            } else {
+                                RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
+                            }
+                            tracing::trace!("have {}", have);
+                            BitswapResponse::Have(have)
+                        }
+                        RequestType::Block => {
+                            let block = store.get(&request.cid).ok().unwrap_or_default();
+                            if let Some(data) = block {
+                                RESPONSES_TOTAL.with_label_values(&["block"]).inc();
+                                SENT_BLOCK_BYTES.inc_by(data.len() as u64);
+                                tracing::trace!("block {}", data.len());
+                                BitswapResponse::Block(data)
+                            } else {
+                                RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
+                                tracing::trace!("have false");
+                                BitswapResponse::Have(false)
+                            }
+                        }
+                    };
+                    responses
+                        .unbounded_send(DbResponse::Bitswap(channel, response))
+                        .ok();
                 }
-                RequestType::Block => {
-                    let block = store.get(&request.cid).ok().unwrap_or_default();
-                    if let Some(data) = block {
-                        RESPONSES_TOTAL.with_label_values(&["block"]).inc();
-                        SENT_BLOCK_BYTES.inc_by(data.len() as u64);
-                        tracing::trace!("block {}", data.len());
-                        BitswapResponse::Block(data)
-                    } else {
-                        RESPONSES_TOTAL.with_label_values(&["dont_have"]).inc();
-                        tracing::trace!("have false");
-                        BitswapResponse::Have(false)
+                DbRequest::Insert(block) => {
+                    if let Err(err) = store.insert(&block) {
+                        tracing::error!("error inserting blocks {}", err);
                     }
                 }
-            };
-            responses.unbounded_send((channel, response)).ok();
+                DbRequest::MissingBlocks(id, cid) => {
+                    let res = store.missing_blocks(&cid);
+                    responses
+                        .unbounded_send(DbResponse::MissingBlocks(id, res))
+                        .ok();
+                }
+            }
         }
     });
     (tx, rx)
@@ -258,7 +273,9 @@ fn start_request_thread<S: BitswapStore>(
 impl<P: StoreParams> Bitswap<P> {
     /// Processes an incoming bitswap request.
     fn inject_request(&mut self, channel: BitswapChannel, request: BitswapRequest) {
-        self.tx.unbounded_send((channel, request)).ok();
+        self.db_tx
+            .unbounded_send(DbRequest::Bitswap(channel, request))
+            .ok();
     }
 
     /// Processes an incoming bitswap response.
@@ -274,7 +291,7 @@ impl<P: StoreParams> Bitswap<P> {
                         let len = data.len();
                         if let Ok(block) = Block::new(info.cid, data) {
                             RECEIVED_BLOCK_BYTES.inc_by(len as u64);
-                            self.batch.push(block);
+                            self.db_tx.unbounded_send(DbRequest::Insert(block)).ok();
                             self.query_manager
                                 .inject_response(id, Response::Block(peer, true));
                         } else {
@@ -286,16 +303,6 @@ impl<P: StoreParams> Bitswap<P> {
                     }
                 }
             }
-        }
-    }
-
-    /// Flush batch to disk.
-    fn flush_batch(&mut self) {
-        if !self.batch.is_empty() {
-            if let Err(err) = self.store.insert_many(&self.batch) {
-                tracing::error!("error inserting blocks {}", err);
-            }
-            self.batch.clear();
         }
     }
 
@@ -490,6 +497,36 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             Self::OutEvent,
         >,
     > {
+        while let Poll::Ready(Some(response)) = Pin::new(&mut self.db_rx).poll_next(cx) {
+            match response {
+                DbResponse::Bitswap(channel, response) => match channel {
+                    BitswapChannel::Bitswap(channel) => {
+                        self.inner.send_response(channel, response).ok();
+                    }
+                    #[cfg(feature = "compat")]
+                    BitswapChannel::Compat(peer_id, cid) => {
+                        let compat = CompatMessage::Response(cid, response);
+                        return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                            peer_id,
+                            handler: NotifyHandler::Any,
+                            event: EitherOutput::Second(compat),
+                        });
+                    }
+                },
+                DbResponse::MissingBlocks(id, res) => match res {
+                    Ok(missing) => {
+                        MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
+                        self.query_manager
+                            .inject_response(id, Response::MissingBlocks(missing));
+                    }
+                    Err(err) => {
+                        self.query_manager.cancel(id);
+                        let event = BitswapEvent::Complete(id, Err(err));
+                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                    }
+                },
+            }
+        }
         while let Some(query) = self.query_manager.next() {
             match query {
                 QueryEvent::Request(id, req) => match req {
@@ -514,19 +551,9 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
                     }
                     Request::MissingBlocks(cid) => {
-                        self.flush_batch();
-                        match self.store.missing_blocks(&cid) {
-                            Ok(missing) => {
-                                MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
-                                self.query_manager
-                                    .inject_response(id, Response::MissingBlocks(missing));
-                            }
-                            Err(err) => {
-                                self.query_manager.cancel(id);
-                                let event = BitswapEvent::Complete(id, Err(err));
-                                return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                            }
-                        }
+                        self.db_tx
+                            .unbounded_send(DbRequest::MissingBlocks(id, cid))
+                            .ok();
                     }
                 },
                 QueryEvent::Progress(id, missing) => {
@@ -625,22 +652,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     error,
                 } => {
                     self.inject_inbound_failure(&peer, request_id, &error);
-                }
-            }
-        }
-        while let Poll::Ready(Some((channel, response))) = Pin::new(&mut self.rx).poll_next(cx) {
-            match channel {
-                BitswapChannel::Bitswap(channel) => {
-                    self.inner.send_response(channel, response).ok();
-                }
-                #[cfg(feature = "compat")]
-                BitswapChannel::Compat(peer_id, cid) => {
-                    let compat = CompatMessage::Response(cid, response);
-                    return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
-                        peer_id,
-                        handler: NotifyHandler::Any,
-                        event: EitherOutput::Second(compat),
-                    });
                 }
             }
         }
