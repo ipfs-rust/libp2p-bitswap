@@ -43,10 +43,6 @@ pub type Channel = ResponseChannel<BitswapResponse>;
 /// Event emitted by the bitswap behaviour.
 #[derive(Debug)]
 pub enum BitswapEvent {
-    /// A get query needs a list of providers to make progress. Once the new set of
-    /// providers is determined the get query can be notified using the `inject_providers`
-    /// method.
-    Providers(QueryId, Cid),
     /// Received a block from a peer. Includes the number of known missing blocks for a
     /// sync query. When a block is received and missing blocks is not empty the counter
     /// is increased. If missing blocks is empty the counter is decremented.
@@ -155,13 +151,18 @@ impl<P: StoreParams> Bitswap<P> {
     }
 
     /// Starts a get query with an initial guess of providers.
-    pub fn get(&mut self, cid: Cid, initial: impl Iterator<Item = PeerId>) -> QueryId {
-        self.query_manager.get(None, cid, initial)
+    pub fn get(&mut self, cid: Cid, peers: impl Iterator<Item = PeerId>) -> QueryId {
+        self.query_manager.get(None, cid, peers)
     }
 
     /// Starts a sync query with an the initial set of missing blocks.
-    pub fn sync(&mut self, cid: Cid, missing: impl Iterator<Item = Cid>) -> QueryId {
-        self.query_manager.sync(cid, missing)
+    pub fn sync(
+        &mut self,
+        cid: Cid,
+        peers: Vec<PeerId>,
+        missing: impl Iterator<Item = Cid>,
+    ) -> QueryId {
+        self.query_manager.sync(cid, peers, missing)
     }
 
     /// Cancels an in progress query. Returns true if a query was cancelled.
@@ -171,13 +172,6 @@ impl<P: StoreParams> Bitswap<P> {
             REQUESTS_CANCELED.inc();
         }
         res
-    }
-
-    /// Adds a provider for a cid. Used for handling the `Providers` event.
-    pub fn inject_providers(&mut self, id: QueryId, providers: Vec<PeerId>) {
-        PROVIDERS_TOTAL.inc_by(providers.len() as u64);
-        self.query_manager
-            .inject_response(id, Response::Providers(providers));
     }
 
     /// Registers prometheus metrics.
@@ -551,10 +545,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             let rid = self.inner.send_request(&peer_id, req);
                             self.requests.insert(BitswapId::Bitswap(rid), id);
                         }
-                        Request::Providers(cid) => {
-                            let event = BitswapEvent::Providers(id, cid);
-                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
-                        }
                         Request::MissingBlocks(cid) => {
                             self.db_tx
                                 .unbounded_send(DbRequest::MissingBlocks(id, cid))
@@ -808,15 +798,6 @@ mod tests {
         }
     }
 
-    fn assert_providers(event: BitswapEvent, cid: Cid) -> QueryId {
-        if let BitswapEvent::Providers(id, cid2) = event {
-            assert_eq!(cid2, cid);
-            id
-        } else {
-            panic!("{:?} is not a provider request", event);
-        }
-    }
-
     fn assert_progress(event: BitswapEvent, id: QueryId, missing: usize) {
         if let BitswapEvent::Progress(id2, missing2) = event {
             assert_eq!(id2, id);
@@ -845,10 +826,7 @@ mod tests {
         peer1.store().insert(*block.cid(), block.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let id = peer2.swarm().get(*block.cid(), std::iter::empty());
-
-        let id1 = assert_providers(peer2.swarm().next().await, *block.cid());
-        peer2.swarm().inject_providers(id1, vec![peer1]);
+        let id = peer2.swarm().get(*block.cid(), std::iter::once(peer1));
 
         assert_complete_ok(peer2.swarm().next().await, id);
     }
@@ -862,9 +840,9 @@ mod tests {
 
         let block = create_block(ipld!(&b"hello world"[..]));
         peer1.store().insert(*block.cid(), block.data().to_vec());
-        peer1.spawn("peer1");
+        let peer1 = peer1.spawn("peer1");
 
-        let id = peer2.swarm().get(*block.cid(), std::iter::empty());
+        let id = peer2.swarm().get(*block.cid(), std::iter::once(peer1));
         peer2.swarm().cancel(id);
         let res = peer2.swarm().next().now_or_never();
         println!("{:?}", res);
@@ -894,10 +872,9 @@ mod tests {
         peer1.store().insert(*b2.cid(), b2.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let id = peer2.swarm().sync(*b2.cid(), std::iter::once(*b2.cid()));
-
-        let id1 = assert_providers(peer2.swarm().next().await, *b2.cid());
-        peer2.swarm().inject_providers(id1, vec![peer1]);
+        let id = peer2
+            .swarm()
+            .sync(*b2.cid(), vec![peer1], std::iter::once(*b2.cid()));
 
         assert_progress(peer2.swarm().next().await, id, 1);
         assert_progress(peer2.swarm().next().await, id, 1);
@@ -914,11 +891,11 @@ mod tests {
 
         let block = create_block(ipld!(&b"hello world"[..]));
         peer1.store().insert(*block.cid(), block.data().to_vec());
-        peer1.spawn("peer1");
+        let peer1 = peer1.spawn("peer1");
 
         let id = peer2
             .swarm()
-            .sync(*block.cid(), std::iter::once(*block.cid()));
+            .sync(*block.cid(), vec![peer1], std::iter::once(*block.cid()));
         peer2.swarm().cancel(id);
         let res = peer2.swarm().next().now_or_never();
         println!("{:?}", res);
