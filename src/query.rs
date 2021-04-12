@@ -452,11 +452,9 @@ impl QueryManager {
                 if res.is_err() {
                     Transition::Complete(res)
                 } else {
-                    if state.missing.is_empty() {
                         state
                             .children
-                            .insert(mgr.missing_blocks(parent.root, parent.cid));
-                    }
+                            .insert(mgr.missing_blocks(parent.root, query.cid));
                     Transition::Next(state)
                 }
             });

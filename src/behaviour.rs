@@ -289,7 +289,7 @@ impl<P: StoreParams> Bitswap<P> {
                             self.query_manager
                                 .inject_response(id, Response::Block(peer, true));
                         } else {
-                            tracing::trace!("received invalid block");
+                            tracing::error!("received invalid block");
                             RECEIVED_INVALID_BLOCK_BYTES.inc_by(len as u64);
                             self.query_manager
                                 .inject_response(id, Response::Block(peer, false));
@@ -306,7 +306,7 @@ impl<P: StoreParams> Bitswap<P> {
         request_id: RequestId,
         error: &OutboundFailure,
     ) {
-        tracing::trace!(
+        tracing::error!(
             "bitswap outbound failure {} {} {:?}",
             peer,
             request_id,
@@ -338,7 +338,7 @@ impl<P: StoreParams> Bitswap<P> {
         request_id: RequestId,
         error: &InboundFailure,
     ) {
-        tracing::trace!(
+        tracing::error!(
             "bitswap inbound failure {} {} {:?}",
             peer,
             request_id,
@@ -433,16 +433,20 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         self.inner.inject_dial_failure(peer_id)
     }
 
-    fn inject_new_listen_addr(&mut self, addr: &Multiaddr) {
-        self.inner.inject_new_listen_addr(addr)
+    fn inject_new_listen_addr(&mut self, id: ListenerId, addr: &Multiaddr) {
+        self.inner.inject_new_listen_addr(id, addr)
     }
 
-    fn inject_expired_listen_addr(&mut self, addr: &Multiaddr) {
-        self.inner.inject_expired_listen_addr(addr)
+    fn inject_expired_listen_addr(&mut self, id: ListenerId, addr: &Multiaddr) {
+        self.inner.inject_expired_listen_addr(id, addr)
     }
 
     fn inject_new_external_addr(&mut self, addr: &Multiaddr) {
         self.inner.inject_new_external_addr(addr)
+    }
+
+    fn inject_expired_external_addr(&mut self, addr: &Multiaddr) {
+        self.inner.inject_expired_external_addr(addr)
     }
 
     fn inject_listener_error(&mut self, id: ListenerId, err: &(dyn Error + 'static)) {
