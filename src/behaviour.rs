@@ -779,7 +779,9 @@ mod tests {
         }
 
         fn add_address(&mut self, peer: &Peer) {
-            self.swarm.add_address(&peer.peer_id, peer.addr.clone());
+            self.swarm
+                .behaviour_mut()
+                .add_address(&peer.peer_id, peer.addr.clone());
         }
 
         fn store(&mut self) -> impl std::ops::DerefMut<Target = FnvHashMap<Cid, Vec<u8>>> + '_ {
@@ -830,7 +832,10 @@ mod tests {
         peer1.store().insert(*block.cid(), block.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let id = peer2.swarm().get(*block.cid(), std::iter::once(peer1));
+        let id = peer2
+            .swarm()
+            .behaviour_mut()
+            .get(*block.cid(), std::iter::once(peer1));
 
         assert_complete_ok(peer2.swarm().next().await, id);
     }
@@ -846,8 +851,11 @@ mod tests {
         peer1.store().insert(*block.cid(), block.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let id = peer2.swarm().get(*block.cid(), std::iter::once(peer1));
-        peer2.swarm().cancel(id);
+        let id = peer2
+            .swarm()
+            .behaviour_mut()
+            .get(*block.cid(), std::iter::once(peer1));
+        peer2.swarm().behaviour_mut().cancel(id);
         let res = peer2.swarm().next().now_or_never();
         println!("{:?}", res);
         assert!(res.is_none());
@@ -876,9 +884,11 @@ mod tests {
         peer1.store().insert(*b2.cid(), b2.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let id = peer2
-            .swarm()
-            .sync(*b2.cid(), vec![peer1], std::iter::once(*b2.cid()));
+        let id =
+            peer2
+                .swarm()
+                .behaviour_mut()
+                .sync(*b2.cid(), vec![peer1], std::iter::once(*b2.cid()));
 
         assert_progress(peer2.swarm().next().await, id, 1);
         assert_progress(peer2.swarm().next().await, id, 1);
@@ -897,10 +907,12 @@ mod tests {
         peer1.store().insert(*block.cid(), block.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let id = peer2
-            .swarm()
-            .sync(*block.cid(), vec![peer1], std::iter::once(*block.cid()));
-        peer2.swarm().cancel(id);
+        let id = peer2.swarm().behaviour_mut().sync(
+            *block.cid(),
+            vec![peer1],
+            std::iter::once(*block.cid()),
+        );
+        peer2.swarm().behaviour_mut().cancel(id);
         let res = peer2.swarm().next().now_or_never();
         println!("{:?}", res);
         assert!(res.is_none());
@@ -919,8 +931,13 @@ mod tests {
         let multiaddr: Multiaddr = "/ip4/54.173.33.96/tcp/4001".parse().unwrap();
 
         let mut peer = Peer::new();
-        peer.swarm().add_address(&peer_id, multiaddr);
-        let id = peer.swarm().get(cid, std::iter::once(peer_id));
+        peer.swarm()
+            .behaviour_mut()
+            .add_address(&peer_id, multiaddr);
+        let id = peer
+            .swarm()
+            .behaviour_mut()
+            .get(cid, std::iter::once(peer_id));
         assert_complete_ok(peer.swarm().next().await, id);
     }
 }
