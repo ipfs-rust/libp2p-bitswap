@@ -237,7 +237,6 @@ impl QueryManager {
         providers: Vec<PeerId>,
         missing: impl Iterator<Item = Cid>,
     ) -> QueryId {
-        assert!(!providers.is_empty());
         let timer = REQUEST_DURATION_SECONDS
             .with_label_values(&["sync"])
             .start_timer();
@@ -644,6 +643,17 @@ mod tests {
         let id1 = assert_request(mgr.next(), Request::MissingBlocks(cid));
         mgr.inject_response(id1, Response::MissingBlocks(vec![]));
 
+        assert_complete(mgr.next(), id, Ok(()));
+    }
+
+    #[test]
+    fn test_sync_query_empty() {
+        tracing_try_init();
+        let mut mgr = QueryManager::default();
+        let cid = Cid::default();
+        let id = mgr.sync(cid, vec![], std::iter::empty());
+        let id1 = assert_request(mgr.next(), Request::MissingBlocks(cid));
+        mgr.inject_response(id1, Response::MissingBlocks(vec![]));
         assert_complete(mgr.next(), id, Ok(()));
     }
 }
