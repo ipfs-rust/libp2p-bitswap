@@ -306,7 +306,7 @@ impl<P: StoreParams> Bitswap<P> {
         request_id: RequestId,
         error: &OutboundFailure,
     ) {
-        tracing::error!(
+        tracing::debug!(
             "bitswap outbound failure {} {} {:?}",
             peer,
             request_id,
