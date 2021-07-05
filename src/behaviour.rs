@@ -604,6 +604,15 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             score,
                         });
                     }
+                    NetworkBehaviourAction::CloseConnection {
+                        peer_id,
+                        connection,
+                    } => {
+                        return Poll::Ready(NetworkBehaviourAction::CloseConnection {
+                            peer_id,
+                            connection,
+                        });
+                    }
                 };
                 match event {
                     RequestResponseEvent::Message { peer, message } => match message {
@@ -679,10 +688,10 @@ mod tests {
     use libipld::multihash::Code;
     use libipld::store::DefaultParams;
     use libp2p::core::muxing::StreamMuxerBox;
-    use libp2p::core::transport::upgrade::Version;
     use libp2p::core::transport::Boxed;
     use libp2p::identity;
     use libp2p::noise::{Keypair, NoiseConfig, X25519Spec};
+    use libp2p::swarm::SwarmEvent;
     use libp2p::tcp::TcpConfig;
     use libp2p::yamux::YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
@@ -706,7 +715,7 @@ mod tests {
 
         let transport = TcpConfig::new()
             .nodelay(true)
-            .upgrade(Version::V1)
+            .upgrade()
             .authenticate(noise)
             .multiplex(YamuxConfig::default())
             .timeout(Duration::from_secs(20))
@@ -802,10 +811,19 @@ mod tests {
             });
             peer_id
         }
+
+        async fn next(&mut self) -> Option<BitswapEvent> {
+            let ev = self.swarm.next().await?;
+            if let SwarmEvent::Behaviour(event) = ev {
+                Some(event)
+            } else {
+                None
+            }
+        }
     }
 
-    fn assert_progress(event: BitswapEvent, id: QueryId, missing: usize) {
-        if let BitswapEvent::Progress(id2, missing2) = event {
+    fn assert_progress(event: Option<BitswapEvent>, id: QueryId, missing: usize) {
+        if let Some(BitswapEvent::Progress(id2, missing2)) = event {
             assert_eq!(id2, id);
             assert_eq!(missing2, missing);
         } else {
@@ -813,8 +831,8 @@ mod tests {
         }
     }
 
-    fn assert_complete_ok(event: BitswapEvent, id: QueryId) {
-        if let BitswapEvent::Complete(id2, Ok(())) = event {
+    fn assert_complete_ok(event: Option<BitswapEvent>, id: QueryId) {
+        if let Some(BitswapEvent::Complete(id2, Ok(()))) = event {
             assert_eq!(id2, id);
         } else {
             panic!("{:?} is not a complete event", event);
@@ -837,7 +855,7 @@ mod tests {
             .behaviour_mut()
             .get(*block.cid(), std::iter::once(peer1));
 
-        assert_complete_ok(peer2.swarm().next().await, id);
+        assert_complete_ok(peer2.next().await, id);
     }
 
     #[async_std::test]
@@ -856,7 +874,7 @@ mod tests {
             .behaviour_mut()
             .get(*block.cid(), std::iter::once(peer1));
         peer2.swarm().behaviour_mut().cancel(id);
-        let res = peer2.swarm().next().now_or_never();
+        let res = peer2.next().now_or_never();
         println!("{:?}", res);
         assert!(res.is_none());
     }
@@ -890,10 +908,10 @@ mod tests {
                 .behaviour_mut()
                 .sync(*b2.cid(), vec![peer1], std::iter::once(*b2.cid()));
 
-        assert_progress(peer2.swarm().next().await, id, 1);
-        assert_progress(peer2.swarm().next().await, id, 1);
+        assert_progress(peer2.next().await, id, 1);
+        assert_progress(peer2.next().await, id, 1);
 
-        assert_complete_ok(peer2.swarm().next().await, id);
+        assert_complete_ok(peer2.next().await, id);
     }
 
     #[async_std::test]
@@ -913,7 +931,7 @@ mod tests {
             std::iter::once(*block.cid()),
         );
         peer2.swarm().behaviour_mut().cancel(id);
-        let res = peer2.swarm().next().now_or_never();
+        let res = peer2.next().now_or_never();
         println!("{:?}", res);
         assert!(res.is_none());
     }
@@ -938,6 +956,6 @@ mod tests {
             .swarm()
             .behaviour_mut()
             .get(cid, std::iter::once(peer_id));
-        assert_complete_ok(peer.swarm().next().await, id);
+        assert_complete_ok(peer.next().await, id);
     }
 }
