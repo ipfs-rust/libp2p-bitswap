@@ -715,7 +715,7 @@ mod tests {
 
         let transport = TcpConfig::new()
             .nodelay(true)
-            .upgrade()
+            .upgrade(libp2p::core::upgrade::Version::V1)
             .authenticate(noise)
             .multiplex(YamuxConfig::default())
             .timeout(Duration::from_secs(20))
@@ -813,11 +813,11 @@ mod tests {
         }
 
         async fn next(&mut self) -> Option<BitswapEvent> {
-            let ev = self.swarm.next().await?;
-            if let SwarmEvent::Behaviour(event) = ev {
-                Some(event)
-            } else {
-                None
+            loop {
+                let ev = self.swarm.next().await?;
+                if let SwarmEvent::Behaviour(event) = ev {
+                    return Some(event);
+                }
             }
         }
     }
