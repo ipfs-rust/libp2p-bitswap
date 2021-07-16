@@ -1,6 +1,6 @@
 use crate::compat::{other, CompatMessage};
 use futures::future::BoxFuture;
-use futures::io::{AsyncRead, AsyncWrite};
+use futures::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use libp2p::core::{upgrade, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use std::{io, iter};
 
@@ -30,9 +30,10 @@ where
 
     fn upgrade_inbound(self, mut socket: TSocket, _info: Self::Info) -> Self::Future {
         Box::pin(async move {
-            let packet = upgrade::read_one(&mut socket, MAX_BUF_SIZE)
+            let packet = upgrade::read_length_prefixed(&mut socket, MAX_BUF_SIZE)
                 .await
                 .map_err(other)?;
+            socket.close().await?;
             let message = CompatMessage::from_bytes(&packet)?;
             Ok(InboundMessage(message))
         })
@@ -59,7 +60,8 @@ where
     fn upgrade_outbound(self, mut socket: TSocket, _info: Self::Info) -> Self::Future {
         Box::pin(async move {
             let bytes = self.to_bytes()?;
-            upgrade::write_one(&mut socket, bytes).await?;
+            upgrade::write_length_prefixed(&mut socket, bytes).await?;
+            socket.close().await?;
             Ok(())
         })
     }
