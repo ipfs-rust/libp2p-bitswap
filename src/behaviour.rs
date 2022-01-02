@@ -29,7 +29,10 @@ use libp2p::request_response::{
     InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse,
     RequestResponseConfig, RequestResponseEvent, RequestResponseMessage, ResponseChannel,
 };
-use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters, ProtocolsHandler};
+use libp2p::swarm::{
+    DialError, IntoProtocolsHandler, NetworkBehaviour, NetworkBehaviourAction, PollParameters,
+    ProtocolsHandler,
+};
 #[cfg(feature = "compat")]
 use libp2p::swarm::{NotifyHandler, OneShotHandler, ProtocolsHandlerSelect};
 use prometheus::Registry;
@@ -384,7 +387,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         #[cfg(not(feature = "compat"))]
         return self.inner.new_handler();
         #[cfg(feature = "compat")]
-        self.inner.new_handler().select(OneShotHandler::default())
+        ProtocolsHandler::select(self.inner.new_handler(), OneShotHandler::default())
     }
 
     fn addresses_of_peer(&mut self, peer_id: &PeerId) -> Vec<Multiaddr> {
@@ -406,9 +409,10 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         peer_id: &PeerId,
         conn: &ConnectionId,
         endpoint: &ConnectedPoint,
+        failed_addressses: Option<&Vec<Multiaddr>>,
     ) {
         self.inner
-            .inject_connection_established(peer_id, conn, endpoint)
+            .inject_connection_established(peer_id, conn, endpoint, failed_addressses)
     }
 
     fn inject_connection_closed(
@@ -416,21 +420,27 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         peer_id: &PeerId,
         conn: &ConnectionId,
         endpoint: &ConnectedPoint,
+        handler: <Self::ProtocolsHandler as IntoProtocolsHandler>::Handler,
     ) {
-        self.inner.inject_connection_closed(peer_id, conn, endpoint)
+        #[cfg(feature = "compat")]
+        let (req_res, _oneshot) = handler.into_inner();
+        #[cfg(not(feature = "compat"))]
+        let req_res = handler;
+        self.inner
+            .inject_connection_closed(peer_id, conn, endpoint, req_res)
     }
 
-    fn inject_addr_reach_failure(
+    fn inject_dial_failure(
         &mut self,
-        peer_id: Option<&PeerId>,
-        addr: &Multiaddr,
-        error: &dyn Error,
+        peer_id: Option<PeerId>,
+        handler: <Self::ProtocolsHandler as IntoProtocolsHandler>::Handler,
+        error: &DialError,
     ) {
-        self.inner.inject_addr_reach_failure(peer_id, addr, error)
-    }
-
-    fn inject_dial_failure(&mut self, peer_id: &PeerId) {
-        self.inner.inject_dial_failure(peer_id)
+        #[cfg(feature = "compat")]
+        let (req_res, _oneshot) = handler.into_inner();
+        #[cfg(not(feature = "compat"))]
+        let req_res = handler;
+        self.inner.inject_dial_failure(peer_id, req_res, error)
     }
 
     fn inject_new_listen_addr(&mut self, id: ListenerId, addr: &Multiaddr) {
@@ -489,12 +499,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         &mut self,
         cx: &mut Context,
         pp: &mut impl PollParameters,
-    ) -> Poll<
-        NetworkBehaviourAction<
-            <Self::ProtocolsHandler as ProtocolsHandler>::InEvent,
-            Self::OutEvent,
-        >,
-    > {
+    ) -> Poll<NetworkBehaviourAction<Self::OutEvent, Self::ProtocolsHandler>> {
         let mut exit = false;
         while !exit {
             exit = true;
@@ -575,14 +580,10 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                 exit = false;
                 let event = match event {
                     NetworkBehaviourAction::GenerateEvent(event) => event,
-                    NetworkBehaviourAction::DialAddress { address } => {
-                        return Poll::Ready(NetworkBehaviourAction::DialAddress { address });
-                    }
-                    NetworkBehaviourAction::DialPeer { peer_id, condition } => {
-                        return Poll::Ready(NetworkBehaviourAction::DialPeer {
-                            peer_id,
-                            condition,
-                        });
+                    NetworkBehaviourAction::Dial { opts, handler } => {
+                        #[cfg(feature = "compat")]
+                        let handler = ProtocolsHandler::select(handler, Default::default());
+                        return Poll::Ready(NetworkBehaviourAction::Dial { opts, handler });
                     }
                     NetworkBehaviourAction::NotifyHandler {
                         peer_id,
@@ -707,7 +708,7 @@ mod tests {
 
     fn mk_transport() -> (PeerId, Boxed<(PeerId, StreamMuxerBox)>) {
         let id_key = identity::Keypair::generate_ed25519();
-        let peer_id = id_key.public().into_peer_id();
+        let peer_id = id_key.public().to_peer_id();
         let dh_key = Keypair::<X25519Spec>::new()
             .into_authentic(&id_key)
             .unwrap();

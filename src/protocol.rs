@@ -98,7 +98,7 @@ impl<P: StoreParams> RequestResponseCodec for BitswapCodec<P> {
         }
         let mut buf = unsigned_varint::encode::u32_buffer();
         let msg_len = unsigned_varint::encode::u32(self.buffer.len() as u32, &mut buf);
-        io.write_all(&msg_len).await?;
+        io.write_all(msg_len).await?;
         io.write_all(&self.buffer).await?;
         Ok(())
     }
@@ -119,7 +119,7 @@ impl<P: StoreParams> RequestResponseCodec for BitswapCodec<P> {
         }
         let mut buf = unsigned_varint::encode::u32_buffer();
         let msg_len = unsigned_varint::encode::u32(self.buffer.len() as u32, &mut buf);
-        io.write_all(&msg_len).await?;
+        io.write_all(msg_len).await?;
         io.write_all(&self.buffer).await?;
         Ok(())
     }
@@ -187,7 +187,7 @@ impl BitswapResponse {
             }
             BitswapResponse::Block(data) => {
                 w.write_all(&[1])?;
-                w.write_all(&data)?;
+                w.write_all(data)?;
             }
         };
         Ok(())
@@ -227,7 +227,8 @@ pub struct MessageTooLarge(usize);
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use libipld::multihash::{Code, MultihashDigest};
+    use libipld::multihash::Code;
+    use multihash::MultihashDigest;
 
     pub fn create_cid(bytes: &[u8]) -> Cid {
         let digest = Code::Blake3_256.digest(bytes);
