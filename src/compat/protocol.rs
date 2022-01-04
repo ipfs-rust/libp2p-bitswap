@@ -67,6 +67,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct InboundMessage(pub Vec<CompatMessage>);
 
 impl From<()> for InboundMessage {
