@@ -30,11 +30,11 @@ use libp2p::request_response::{
     RequestResponseConfig, RequestResponseEvent, RequestResponseMessage, ResponseChannel,
 };
 use libp2p::swarm::{
-    DialError, IntoProtocolsHandler, NetworkBehaviour, NetworkBehaviourAction, PollParameters,
-    ProtocolsHandler,
+    ConnectionHandler, DialError, IntoConnectionHandler, NetworkBehaviour, NetworkBehaviourAction,
+    PollParameters,
 };
 #[cfg(feature = "compat")]
-use libp2p::swarm::{NotifyHandler, OneShotHandler, ProtocolsHandlerSelect};
+use libp2p::swarm::{ConnectionHandlerSelect, NotifyHandler, OneShotHandler};
 use prometheus::Registry;
 use std::error::Error;
 use std::pin::Pin;
@@ -372,36 +372,26 @@ impl<P: StoreParams> Bitswap<P> {
 
 impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     #[cfg(not(feature = "compat"))]
-    type ProtocolsHandler =
-        <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler;
+    type ConnectionHandler =
+        <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ConnectionHandler;
 
     #[cfg(feature = "compat")]
     #[allow(clippy::type_complexity)]
-    type ProtocolsHandler = ProtocolsHandlerSelect<
-        <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ProtocolsHandler,
+    type ConnectionHandler = ConnectionHandlerSelect<
+        <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ConnectionHandler,
         OneShotHandler<CompatProtocol, CompatMessage, InboundMessage>,
     >;
     type OutEvent = BitswapEvent;
 
-    fn new_handler(&mut self) -> Self::ProtocolsHandler {
+    fn new_handler(&mut self) -> Self::ConnectionHandler {
         #[cfg(not(feature = "compat"))]
         return self.inner.new_handler();
         #[cfg(feature = "compat")]
-        ProtocolsHandler::select(self.inner.new_handler(), OneShotHandler::default())
+        ConnectionHandler::select(self.inner.new_handler(), OneShotHandler::default())
     }
 
     fn addresses_of_peer(&mut self, peer_id: &PeerId) -> Vec<Multiaddr> {
         self.inner.addresses_of_peer(peer_id)
-    }
-
-    fn inject_connected(&mut self, peer_id: &PeerId) {
-        self.inner.inject_connected(peer_id)
-    }
-
-    fn inject_disconnected(&mut self, peer_id: &PeerId) {
-        self.inner.inject_disconnected(peer_id);
-        #[cfg(feature = "compat")]
-        self.compat.remove(peer_id);
     }
 
     fn inject_connection_established(
@@ -410,9 +400,15 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         conn: &ConnectionId,
         endpoint: &ConnectedPoint,
         failed_addressses: Option<&Vec<Multiaddr>>,
+        other_established: usize,
     ) {
-        self.inner
-            .inject_connection_established(peer_id, conn, endpoint, failed_addressses)
+        self.inner.inject_connection_established(
+            peer_id,
+            conn,
+            endpoint,
+            failed_addressses,
+            other_established,
+        )
     }
 
     fn inject_connection_closed(
@@ -420,20 +416,25 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         peer_id: &PeerId,
         conn: &ConnectionId,
         endpoint: &ConnectedPoint,
-        handler: <Self::ProtocolsHandler as IntoProtocolsHandler>::Handler,
+        handler: <Self::ConnectionHandler as IntoConnectionHandler>::Handler,
+        remaining_established: usize,
     ) {
+        #[cfg(feature = "compat")]
+        if remaining_established == 0 {
+            self.compat.remove(peer_id);
+        }
         #[cfg(feature = "compat")]
         let (req_res, _oneshot) = handler.into_inner();
         #[cfg(not(feature = "compat"))]
         let req_res = handler;
         self.inner
-            .inject_connection_closed(peer_id, conn, endpoint, req_res)
+            .inject_connection_closed(peer_id, conn, endpoint, req_res, remaining_established)
     }
 
     fn inject_dial_failure(
         &mut self,
         peer_id: Option<PeerId>,
-        handler: <Self::ProtocolsHandler as IntoProtocolsHandler>::Handler,
+        handler: <Self::ConnectionHandler as IntoConnectionHandler>::Handler,
         error: &DialError,
     ) {
         #[cfg(feature = "compat")]
@@ -471,7 +472,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         &mut self,
         peer_id: PeerId,
         conn: ConnectionId,
-        event: <Self::ProtocolsHandler as ProtocolsHandler>::OutEvent,
+        event: <Self::ConnectionHandler as ConnectionHandler>::OutEvent,
     ) {
         #[cfg(not(feature = "compat"))]
         return self.inner.inject_event(peer_id, conn, event);
@@ -499,7 +500,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         &mut self,
         cx: &mut Context,
         pp: &mut impl PollParameters,
-    ) -> Poll<NetworkBehaviourAction<Self::OutEvent, Self::ProtocolsHandler>> {
+    ) -> Poll<NetworkBehaviourAction<Self::OutEvent, Self::ConnectionHandler>> {
         let mut exit = false;
         while !exit {
             exit = true;
@@ -582,7 +583,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     NetworkBehaviourAction::GenerateEvent(event) => event,
                     NetworkBehaviourAction::Dial { opts, handler } => {
                         #[cfg(feature = "compat")]
-                        let handler = ProtocolsHandler::select(handler, Default::default());
+                        let handler = ConnectionHandler::select(handler, Default::default());
                         return Poll::Ready(NetworkBehaviourAction::Dial { opts, handler });
                     }
                     NetworkBehaviourAction::NotifyHandler {
