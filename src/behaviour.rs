@@ -21,9 +21,10 @@ use futures::task::{Context, Poll};
 use libipld::error::BlockNotFound;
 use libipld::store::StoreParams;
 use libipld::{Block, Cid, Result};
-use libp2p::core::connection::{ConnectionId, ListenerId};
+use libp2p::core::connection::ConnectionId;
 #[cfg(feature = "compat")]
 use libp2p::core::either::EitherOutput;
+use libp2p::core::transport::ListenerId;
 use libp2p::core::{ConnectedPoint, Multiaddr, PeerId};
 use libp2p::request_response::{
     InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse,
@@ -694,7 +695,7 @@ mod tests {
     use libp2p::identity;
     use libp2p::noise::{Keypair, NoiseConfig, X25519Spec};
     use libp2p::swarm::SwarmEvent;
-    use libp2p::tcp::TcpConfig;
+    use libp2p::tcp::TcpTransport;
     use libp2p::yamux::YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
     use std::sync::{Arc, Mutex};
@@ -715,8 +716,7 @@ mod tests {
             .unwrap();
         let noise = NoiseConfig::xx(dh_key).into_authenticated();
 
-        let transport = TcpConfig::new()
-            .nodelay(true)
+        let transport = TcpTransport::default()
             .upgrade(libp2p::core::upgrade::Version::V1)
             .authenticate(noise)
             .multiplex(YamuxConfig::default())
