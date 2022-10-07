@@ -15,30 +15,31 @@ use crate::stats::*;
 use fnv::FnvHashMap;
 #[cfg(feature = "compat")]
 use fnv::FnvHashSet;
-use futures::channel::mpsc;
-use futures::stream::{Stream, StreamExt};
-use futures::task::{Context, Poll};
-use libipld::error::BlockNotFound;
-use libipld::store::StoreParams;
-use libipld::{Block, Cid, Result};
-use libp2p::core::connection::{ConnectionId, ListenerId};
+use futures::{
+    channel::mpsc,
+    stream::{Stream, StreamExt},
+    task::{Context, Poll},
+};
+use libipld::{error::BlockNotFound, store::StoreParams, Block, Cid, Result};
 #[cfg(feature = "compat")]
 use libp2p::core::either::EitherOutput;
-use libp2p::core::{ConnectedPoint, Multiaddr, PeerId};
-use libp2p::request_response::{
-    InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse,
-    RequestResponseConfig, RequestResponseEvent, RequestResponseMessage, ResponseChannel,
-};
-use libp2p::swarm::{
-    ConnectionHandler, DialError, IntoConnectionHandler, NetworkBehaviour, NetworkBehaviourAction,
-    PollParameters,
+use libp2p::core::{
+    connection::ConnectionId, transport::ListenerId, ConnectedPoint, Multiaddr, PeerId,
 };
 #[cfg(feature = "compat")]
 use libp2p::swarm::{ConnectionHandlerSelect, NotifyHandler, OneShotHandler};
+use libp2p::{
+    request_response::{
+        InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse,
+        RequestResponseConfig, RequestResponseEvent, RequestResponseMessage, ResponseChannel,
+    },
+    swarm::{
+        ConnectionHandler, DialError, IntoConnectionHandler, NetworkBehaviour,
+        NetworkBehaviourAction, PollParameters,
+    },
+};
 use prometheus::Registry;
-use std::error::Error;
-use std::pin::Pin;
-use std::time::Duration;
+use std::{error::Error, pin::Pin, time::Duration};
 
 /// Bitswap response channel.
 pub type Channel = ResponseChannel<BitswapResponse>;
@@ -694,7 +695,7 @@ mod tests {
     use libp2p::identity;
     use libp2p::noise::{Keypair, NoiseConfig, X25519Spec};
     use libp2p::swarm::SwarmEvent;
-    use libp2p::tcp::TcpConfig;
+    use libp2p::tcp::{GenTcpConfig, TcpTransport};
     use libp2p::yamux::YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
     use std::sync::{Arc, Mutex};
@@ -715,8 +716,7 @@ mod tests {
             .unwrap();
         let noise = NoiseConfig::xx(dh_key).into_authenticated();
 
-        let transport = TcpConfig::new()
-            .nodelay(true)
+        let transport = TcpTransport::new(GenTcpConfig::new().nodelay(true))
             .upgrade(libp2p::core::upgrade::Version::V1)
             .authenticate(noise)
             .multiplex(YamuxConfig::default())
