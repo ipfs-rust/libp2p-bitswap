@@ -27,10 +27,6 @@ db query. The bitswap api looks as follows:
 ```rust
 #[derive(Debug)]
 pub enum BitswapEvent {
-    /// A get query needs a list of providers to make progress. Once the new set of
-    /// providers is determined the get query can be notified using the `inject_providers`
-    /// method.
-    Providers(QueryId, Cid),
     /// Received a block from a peer. Includes the number of known missing blocks for a
     /// sync query. When a block is received and missing blocks is not empty the counter
     /// is increased. If missing blocks is empty the counter is decremented.
@@ -57,8 +53,6 @@ pub struct BitswapConfig {
     pub request_timeout: Duration,
     /// Time a connection is kept alive.
     pub connection_keep_alive: Duration,
-    /// The number of concurrent requests per peer.
-    pub receive_limit: NonZeroU16,
 }
 
 impl<P: StoreParams> Bitswap<P> {
@@ -80,14 +74,8 @@ impl<P: StoreParams> Bitswap<P> {
     /// Cancels an in progress query. Returns true if a query was cancelled.
     pub fn cancel(&mut self, id: QueryId) -> bool;
 
-    /// Adds a provider for a cid. Used for handling the `Providers` event.
-    pub fn inject_providers(&mut self, id: QueryId, providers: Vec<PeerId>);
-
     /// Register bitswap stats in a prometheus registry.
     pub fn register_metrics(&self, registry: &Registry) -> Result<()>;
-
-    /// Polls the behaviour for the next bitswap event.
-    pub fn poll(&mut self, cx: &mut Context) -> BitswapEvent;
 }
 ```
 
