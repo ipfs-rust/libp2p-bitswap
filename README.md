@@ -2,6 +2,7 @@
 [![docs.rs](https://img.shields.io/badge/api-rustdoc-blue.svg)](https://docs.rs/libp2p-bitswap)
 
 # libp2p-bitswap
+
 Implementation of the bitswap protocol.
 
 ## Efficiently syncing dags of blocks
@@ -66,10 +67,10 @@ impl<P: StoreParams> Bitswap<P> {
     pub fn remove_address(&mut self, peer_id: &PeerId, addr: &Multiaddr);
 
     /// Starts a get query with an initial guess of providers.
-    pub fn get(&mut self, cid: Cid, initial: impl Iterator<Item = PeerId>) -> QueryId;
+    pub fn get(&mut self, cid: Cid, peers: impl Iterator<Item = PeerId>) -> QueryId;
 
     /// Starts a sync query with an the initial set of missing blocks.
-    pub fn sync(&mut self, cid: Cid, missing: impl Iterator<Item = Cid>) -> QueryId;
+    pub fn sync(&mut self, cid: Cid, peers: Vec<PeerId>, missing: impl Iterator<Item = Cid>) -> QueryId;
 
     /// Cancels an in progress query. Returns true if a query was cancelled.
     pub fn cancel(&mut self, id: QueryId) -> bool;
@@ -93,4 +94,5 @@ a sync query that runs get queries in parallel for all the references of a block
 providers that had a block is used as the initial set in a reference query.
 
 ## License
+
 MIT OR Apache-2.0
