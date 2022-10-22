@@ -45,6 +45,8 @@ jobs:
 
     runs-on: ${{ matrix.platform.host }}
     steps:
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v1
     - name: Checkout sources
       uses: actions/checkout@v2
 
@@ -91,6 +93,8 @@ jobs:
   lint-rust:
     runs-on: ubuntu-latest
     steps:
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v1
     - name: Checkout sources
       uses: actions/checkout@v2
 
