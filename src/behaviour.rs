@@ -942,13 +942,13 @@ mod tests {
     #[async_std::test]
     async fn compat_test() {
         tracing_try_init();
-        let cid: Cid = "QmXQsqVRpp2W7fbYZHi4aB2Xkqfd3DpwWskZoLVEYigMKC"
+        let cid: Cid = "QmP8njGuyiw9cjkhwHD9nZhyBTHufXFanAvZgcy9xYoWiB"
             .parse()
             .unwrap();
-        let peer_id: PeerId = "QmRSGx67Kq8w7xSBDia7hQfbfuvauMQGgxcwSWw976x4BS"
+        let peer_id: PeerId = "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ"
             .parse()
             .unwrap();
-        let multiaddr: Multiaddr = "/ip4/54.173.33.96/tcp/4001".parse().unwrap();
+        let multiaddr: Multiaddr = "/ip4/104.131.131.82/tcp/4001".parse().unwrap();
 
         let mut peer = Peer::new();
         peer.swarm()
