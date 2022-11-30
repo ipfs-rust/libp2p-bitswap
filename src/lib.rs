@@ -1,6 +1,7 @@
 //! Bitswap protocol implementation
 #![deny(missing_docs)]
 #![deny(warnings)]
+#![allow(clippy::derive_partial_eq_without_eq)]
 
 mod behaviour;
 #[cfg(feature = "compat")]
