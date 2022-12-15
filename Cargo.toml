@@ -1,6 +1,6 @@
 [package]
 name = "libp2p-bitswap"
-version = "0.24.0"
+version = "0.25.0"
 authors = ["David Craven <david@craven.ch>"]
 edition = "2018"
 description = "Implementation of the ipfs bitswap protocol."
@@ -19,7 +19,7 @@ fnv = "1.0.7"
 futures = "0.3.19"
 lazy_static = "1.4.0"
 libipld = { version = "0.14.0", default-features = false }
-libp2p = { version = "0.49.0", features = ["request-response"] }
+libp2p = { version = "0.50.0", features = ["request-response"] }
 prometheus = "0.13.0"
 prost = { version = "0.11", optional = true }
 thiserror = "1.0.30"
@@ -30,6 +30,6 @@ unsigned-varint = { version = "0.7.1", features = ["futures", "std"] }
 async-std = { version = "1.10.0", features = ["attributes"] }
 env_logger = "0.9.0"
 libipld = { version = "0.14.0", default-features = false, features = ["dag-cbor"] }
-libp2p = { version = "0.49.0", features = ["tcp", "noise", "yamux", "rsa", "async-std"] }
+libp2p = { version = "0.50.0", features = ["tcp", "noise", "yamux", "rsa", "async-std"] }
 multihash = { version = "0.16.1", default-features = false, features = ["blake3"] }
 tracing-subscriber = { version = "0.3.5", features = ["env-filter"] }
