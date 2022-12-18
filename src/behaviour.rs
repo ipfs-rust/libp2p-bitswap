@@ -513,7 +513,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         return self.inner.on_connection_handler_event(peer_id, conn, event);
         #[cfg(feature = "compat")]
         match event {
-            EitherOutput::First(event) => self.inner.inject_event(peer_id, conn, event),
+            EitherOutput::First(event) => self.inner.on_connection_handler_event(peer_id, conn, event),
             EitherOutput::Second(msg) => {
                 for msg in msg.0 {
                     match msg {
