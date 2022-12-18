@@ -26,6 +26,10 @@ use libp2p::core::either::EitherOutput;
 use libp2p::core::{
     connection::ConnectionId, transport::ListenerId, ConnectedPoint, Multiaddr, PeerId,
 };
+use libp2p::swarm::derive_prelude::{
+    ConnectionClosed, ConnectionEstablished, DialFailure, ExpiredExternalAddr, ExpiredListenAddr,
+    FromSwarm, ListenerClosed, ListenerError, NewExternalAddr, NewListenAddr,
+};
 #[cfg(feature = "compat")]
 use libp2p::swarm::{ConnectionHandlerSelect, NotifyHandler, OneShotHandler};
 use libp2p::{
@@ -403,13 +407,14 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         failed_addressses: Option<&Vec<Multiaddr>>,
         other_established: usize,
     ) {
-        self.inner.inject_connection_established(
-            peer_id,
-            conn,
-            endpoint,
-            failed_addressses,
-            other_established,
-        )
+        self.inner
+            .on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+                peer_id: *peer_id,
+                connection_id: *conn,
+                endpoint,
+                failed_addresses: &failed_addressses.cloned().unwrap_or_default(),
+                other_established,
+            }))
     }
 
     fn inject_connection_closed(
@@ -429,7 +434,13 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         #[cfg(not(feature = "compat"))]
         let req_res = handler;
         self.inner
-            .inject_connection_closed(peer_id, conn, endpoint, req_res, remaining_established)
+            .on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+                peer_id: *peer_id,
+                connection_id: *conn,
+                endpoint,
+                handler: req_res,
+                remaining_established,
+            }));
     }
 
     fn inject_dial_failure(
@@ -442,31 +453,54 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         let (req_res, _oneshot) = handler.into_inner();
         #[cfg(not(feature = "compat"))]
         let req_res = handler;
-        self.inner.inject_dial_failure(peer_id, req_res, error)
+        self.inner
+            .on_swarm_event(FromSwarm::DialFailure(DialFailure {
+                peer_id,
+                handler: req_res,
+                error,
+            }));
     }
 
     fn inject_new_listen_addr(&mut self, id: ListenerId, addr: &Multiaddr) {
-        self.inner.inject_new_listen_addr(id, addr)
+        self.inner
+            .on_swarm_event(FromSwarm::NewListenAddr(NewListenAddr {
+                addr,
+                listener_id: id,
+            }))
     }
 
     fn inject_expired_listen_addr(&mut self, id: ListenerId, addr: &Multiaddr) {
-        self.inner.inject_expired_listen_addr(id, addr)
+        self.inner
+            .on_swarm_event(FromSwarm::ExpiredListenAddr(ExpiredListenAddr {
+                listener_id: id,
+                addr,
+            }));
     }
 
     fn inject_new_external_addr(&mut self, addr: &Multiaddr) {
-        self.inner.inject_new_external_addr(addr)
+        self.inner
+            .on_swarm_event(FromSwarm::NewExternalAddr(NewExternalAddr { addr }));
     }
 
     fn inject_expired_external_addr(&mut self, addr: &Multiaddr) {
-        self.inner.inject_expired_external_addr(addr)
+        self.inner
+            .on_swarm_event(FromSwarm::ExpiredExternalAddr(ExpiredExternalAddr { addr }));
     }
 
     fn inject_listener_error(&mut self, id: ListenerId, err: &(dyn Error + 'static)) {
-        self.inner.inject_listener_error(id, err)
+        self.inner
+            .on_swarm_event(FromSwarm::ListenerError(ListenerError {
+                listener_id: id,
+                err,
+            }));
     }
 
     fn inject_listener_closed(&mut self, id: ListenerId, reason: Result<(), &std::io::Error>) {
-        self.inner.inject_listener_closed(id, reason)
+        self.inner
+            .on_swarm_event(FromSwarm::ListenerClosed(ListenerClosed {
+                listener_id: id,
+                reason,
+            }));
     }
 
     fn inject_event(
@@ -476,7 +510,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         event: <Self::ConnectionHandler as ConnectionHandler>::OutEvent,
     ) {
         #[cfg(not(feature = "compat"))]
-        return self.inner.inject_event(peer_id, conn, event);
+        return self.inner.on_connection_handler_event(peer_id, conn, event);
         #[cfg(feature = "compat")]
         match event {
             EitherOutput::First(event) => self.inner.inject_event(peer_id, conn, event),
@@ -695,7 +729,7 @@ mod tests {
     use libp2p::identity;
     use libp2p::noise::{Keypair, NoiseConfig, X25519Spec};
     use libp2p::swarm::SwarmEvent;
-    use libp2p::tcp::{GenTcpConfig, TcpTransport};
+    use libp2p::tcp::{Config as GenTcpConfig, async_io::Transport as TcpTransport};
     use libp2p::yamux::YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
     use std::sync::{Arc, Mutex};
@@ -773,7 +807,7 @@ mod tests {
         fn new() -> Self {
             let (peer_id, trans) = mk_transport();
             let store = Store::default();
-            let mut swarm = Swarm::new(
+            let mut swarm = Swarm::with_async_std_executor(
                 trans,
                 Bitswap::new(BitswapConfig::new(), store.clone()),
                 peer_id,
