@@ -471,6 +471,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         conn: ConnectionId,
         event: <Self::ConnectionHandler as ConnectionHandler>::OutEvent,
     ) {
+        tracing::trace!(?event, "on_connection_handler_event");
         #[cfg(not(feature = "compat"))]
         return self.inner.on_connection_handler_event(peer_id, conn, event);
         #[cfg(feature = "compat")]
@@ -945,10 +946,10 @@ mod tests {
         let cid: Cid = "QmP8njGuyiw9cjkhwHD9nZhyBTHufXFanAvZgcy9xYoWiB"
             .parse()
             .unwrap();
-        let peer_id: PeerId = "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ"
+        let peer_id: PeerId = "12D3KooWC1EaEEpghwnPdd89LaPTKEweD1PRLz4aRBkJEA9UiUuS"
             .parse()
             .unwrap();
-        let multiaddr: Multiaddr = "/ip4/104.131.131.82/tcp/4001".parse().unwrap();
+        let multiaddr: Multiaddr = "/ip4/95.217.194.97/tcp/8008".parse().unwrap();
 
         let mut peer = Peer::new();
         peer.swarm()

@@ -29,11 +29,20 @@ where
 
     fn upgrade_inbound(self, mut socket: TSocket, _info: Self::Info) -> Self::Future {
         Box::pin(async move {
+            tracing::trace!("upgrading inbound");
             let packet = upgrade::read_length_prefixed(&mut socket, MAX_BUF_SIZE)
                 .await
-                .map_err(other)?;
+                .map_err(|err| {
+                    tracing::debug!(%err, "inbound upgrade error");
+                    other(err)
+                })?;
             socket.close().await?;
-            let message = CompatMessage::from_bytes(&packet)?;
+            tracing::trace!("inbound upgrade done, closing");
+            let message = CompatMessage::from_bytes(&packet).map_err(|e| {
+                tracing::debug!(%e, "inbound upgrade error");
+                e
+            })?;
+            tracing::trace!("inbound upgrade closed");
             Ok(InboundMessage(message))
         })
     }
