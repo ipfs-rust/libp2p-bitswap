@@ -504,10 +504,12 @@ impl QueryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_subscriber::fmt::TestWriter;
 
     fn tracing_try_init() {
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(TestWriter::new())
             .try_init()
             .ok();
     }
