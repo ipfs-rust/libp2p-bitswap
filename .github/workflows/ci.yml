@@ -39,6 +39,7 @@ jobs:
         #   cross: true
     env:
       RUST_BACKTRACE: 1
+      RUST_LOG: debug
       CARGO_INCREMENTAL: 0
       LLVM_CONFIG_PATH: /usr/local/opt/llvm/bin/llvm-config
       NDK_HOME: /usr/local/lib/android/sdk/ndk-bundle
