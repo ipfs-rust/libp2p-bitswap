@@ -6,7 +6,7 @@
 //! The `Bitswap` struct implements the `NetworkBehaviour` trait. When used, it
 //! will allow providing and reciving IPFS blocks.
 #[cfg(feature = "compat")]
-use crate::compat::{CompatMessage, CompatProtocol, InboundMessage};
+use crate::compat::{CompatMessage, CompatProtocolInbound, CompatProtocolOutbound, InboundMessage};
 use crate::protocol::{
     BitswapCodec, BitswapProtocol, BitswapRequest, BitswapResponse, RequestType,
 };
@@ -25,6 +25,8 @@ use libipld::{error::BlockNotFound, store::StoreParams, Block, Cid, Result};
 use libp2p::core::either::EitherOutput;
 use libp2p::core::{connection::ConnectionId, Multiaddr, PeerId};
 use libp2p::swarm::derive_prelude::{ConnectionClosed, DialFailure, FromSwarm, ListenFailure};
+#[cfg(feature = "compat")]
+use libp2p::swarm::SubstreamProtocol;
 #[cfg(feature = "compat")]
 use libp2p::swarm::{ConnectionHandlerSelect, NotifyHandler, OneShotHandler};
 use libp2p::{
@@ -72,6 +74,9 @@ pub struct BitswapConfig {
     pub request_timeout: Duration,
     /// Time a connection is kept alive.
     pub connection_keep_alive: Duration,
+    /// Custom protocol name for go-bitswap compatible mode, default is [crate::compat::DEFAULT_COMPAT_PROTOCOL_NAME]
+    #[cfg(feature = "compat")]
+    pub compat_protocol_name: &'static [u8],
 }
 
 impl BitswapConfig {
@@ -80,6 +85,8 @@ impl BitswapConfig {
         Self {
             request_timeout: Duration::from_secs(10),
             connection_keep_alive: Duration::from_secs(10),
+            #[cfg(feature = "compat")]
+            compat_protocol_name: crate::compat::DEFAULT_COMPAT_PROTOCOL_NAME,
         }
     }
 }
@@ -115,6 +122,9 @@ pub struct Bitswap<P: StoreParams> {
     db_tx: mpsc::UnboundedSender<DbRequest<P>>,
     /// Db response channel.
     db_rx: mpsc::UnboundedReceiver<DbResponse>,
+    /// Custom protocol name for go-bitswap compatible mode, default is [DEFAULT_COMPAT_PROTOCOL_NAME]
+    #[cfg(feature = "compat")]
+    pub compat_protocol_name: &'static [u8],
     /// Compat peers.
     #[cfg(feature = "compat")]
     compat: FnvHashSet<PeerId>,
@@ -135,6 +145,8 @@ impl<P: StoreParams> Bitswap<P> {
             requests: Default::default(),
             db_tx,
             db_rx,
+            #[cfg(feature = "compat")]
+            compat_protocol_name: config.compat_protocol_name,
             #[cfg(feature = "compat")]
             compat: Default::default(),
         }
@@ -365,6 +377,21 @@ impl<P: StoreParams> Bitswap<P> {
             }
         }
     }
+
+    #[cfg(feature = "compat")]
+    fn new_compat_handler(
+        &self,
+    ) -> OneShotHandler<CompatProtocolInbound, CompatProtocolOutbound, InboundMessage> {
+        OneShotHandler::new(
+            SubstreamProtocol::new(
+                CompatProtocolInbound {
+                    protocol_name: self.compat_protocol_name,
+                },
+                (),
+            ),
+            Default::default(),
+        )
+    }
 }
 
 impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
@@ -376,7 +403,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     #[allow(clippy::type_complexity)]
     type ConnectionHandler = ConnectionHandlerSelect<
         <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ConnectionHandler,
-        OneShotHandler<CompatProtocol, CompatMessage, InboundMessage>,
+        OneShotHandler<CompatProtocolInbound, CompatProtocolOutbound, InboundMessage>,
     >;
     type OutEvent = BitswapEvent;
 
@@ -384,7 +411,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         #[cfg(not(feature = "compat"))]
         return self.inner.new_handler();
         #[cfg(feature = "compat")]
-        ConnectionHandler::select(self.inner.new_handler(), OneShotHandler::default())
+        ConnectionHandler::select(self.inner.new_handler(), self.new_compat_handler())
     }
 
     fn addresses_of_peer(&mut self, peer_id: &PeerId) -> Vec<Multiaddr> {
@@ -517,7 +544,10 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
                                 peer_id,
                                 handler: NotifyHandler::Any,
-                                event: EitherOutput::Second(compat),
+                                event: EitherOutput::Second(CompatProtocolOutbound {
+                                    protocol_name: self.compat_protocol_name,
+                                    message: compat,
+                                }),
                             });
                         }
                     },
@@ -583,7 +613,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     NetworkBehaviourAction::GenerateEvent(event) => event,
                     NetworkBehaviourAction::Dial { opts, handler } => {
                         #[cfg(feature = "compat")]
-                        let handler = ConnectionHandler::select(handler, Default::default());
+                        let handler = ConnectionHandler::select(handler, self.new_compat_handler());
                         return Poll::Ready(NetworkBehaviourAction::Dial { opts, handler });
                     }
                     NetworkBehaviourAction::NotifyHandler {
@@ -652,9 +682,10 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                     return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
                                         peer_id: peer,
                                         handler: NotifyHandler::Any,
-                                        event: EitherOutput::Second(CompatMessage::Request(
-                                            request,
-                                        )),
+                                        event: EitherOutput::Second(CompatProtocolOutbound {
+                                            protocol_name: self.compat_protocol_name,
+                                            message: CompatMessage::Request(request),
+                                        }),
                                     });
                                 }
                             }

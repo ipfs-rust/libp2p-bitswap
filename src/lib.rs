@@ -12,3 +12,6 @@ mod stats;
 
 pub use crate::behaviour::{Bitswap, BitswapConfig, BitswapEvent, BitswapStore, Channel};
 pub use crate::query::QueryId;
+
+/// Re-exports
+pub use libipld;
