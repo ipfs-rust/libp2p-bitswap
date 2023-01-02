@@ -145,10 +145,13 @@ mod tests {
             let stream = TcpStream::connect(&listener_addr).await.unwrap();
             upgrade::apply_outbound(
                 stream,
-                CompatMessage::Request(BitswapRequest {
-                    ty: RequestType::Have,
-                    cid: Cid::default(),
-                }),
+                CompatProtocolOutbound {
+                    protocol_name: DEFAULT_COMPAT_PROTOCOL_NAME,
+                    message: CompatMessage::Request(BitswapRequest {
+                        ty: RequestType::Have,
+                        cid: Cid::default(),
+                    }),
+                },
                 upgrade::Version::V1,
             )
             .await
