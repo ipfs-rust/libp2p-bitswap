@@ -991,10 +991,10 @@ mod tests {
         let cid: Cid = "QmP8njGuyiw9cjkhwHD9nZhyBTHufXFanAvZgcy9xYoWiB"
             .parse()
             .unwrap();
-        let peer_id: PeerId = "12D3KooWC1EaEEpghwnPdd89LaPTKEweD1PRLz4aRBkJEA9UiUuS"
+        let peer_id: PeerId = "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ"
             .parse()
             .unwrap();
-        let multiaddr: Multiaddr = "/ip4/95.217.194.97/tcp/8008".parse().unwrap();
+        let multiaddr: Multiaddr = "/ip4/104.131.131.82/tcp/4001".parse().unwrap();
 
         let mut peer = Peer::new();
         peer.swarm()
