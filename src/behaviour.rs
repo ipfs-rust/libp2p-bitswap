@@ -21,16 +21,23 @@ use futures::{
     task::{Context, Poll},
 };
 use libipld::{error::BlockNotFound, store::StoreParams, Block, Cid, Result};
+
+use libp2p::core::{Endpoint, Multiaddr, PeerId};
+
 #[cfg(feature = "compat")]
-use libp2p::core::either::EitherOutput;
-use libp2p::core::{connection::ConnectionId, Multiaddr, PeerId};
-use libp2p::swarm::derive_prelude::{ConnectionClosed, DialFailure, FromSwarm, ListenFailure};
+use libp2p::swarm::derive_prelude::Either;
+use libp2p::swarm::{
+    derive_prelude::{ConnectionClosed, DialFailure, FromSwarm, ListenFailure},
+    ConnectionId, THandlerInEvent,
+};
+use libp2p::swarm::{ConnectionDenied, THandler};
 #[cfg(feature = "compat")]
 use libp2p::swarm::{ConnectionHandlerSelect, NotifyHandler, OneShotHandler};
 use libp2p::{
     request_response::{
-        InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse,
-        RequestResponseConfig, RequestResponseEvent, RequestResponseMessage, ResponseChannel,
+        Behaviour as RequestResponse, Config as RequestResponseConfig,
+        Event as RequestResponseEvent, InboundFailure, Message as RequestResponseMessage,
+        OutboundFailure, ProtocolSupport, RequestId, ResponseChannel,
     },
     swarm::{ConnectionHandler, NetworkBehaviour, NetworkBehaviourAction, PollParameters},
 };
@@ -380,15 +387,61 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     >;
     type OutEvent = BitswapEvent;
 
-    fn new_handler(&mut self) -> Self::ConnectionHandler {
+    fn handle_established_inbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        local_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
         #[cfg(not(feature = "compat"))]
-        return self.inner.new_handler();
+        return self.inner.handle_established_inbound_connection(
+            connection_id,
+            peer,
+            local_addr,
+            remote_addr,
+        );
         #[cfg(feature = "compat")]
-        ConnectionHandler::select(self.inner.new_handler(), OneShotHandler::default())
+        return self
+            .inner
+            .handle_established_inbound_connection(connection_id, peer, local_addr, remote_addr)
+            .map(|handle| ConnectionHandler::select(handle, OneShotHandler::default()));
     }
 
-    fn addresses_of_peer(&mut self, peer_id: &PeerId) -> Vec<Multiaddr> {
-        self.inner.addresses_of_peer(peer_id)
+    fn handle_established_outbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        addr: &Multiaddr,
+        role_override: Endpoint,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        #[cfg(not(feature = "compat"))]
+        return self.inner.handle_established_outbound_connection(
+            connection_id,
+            peer,
+            addr,
+            role_override,
+        );
+        #[cfg(feature = "compat")]
+        return self
+            .inner
+            .handle_established_outbound_connection(connection_id, peer, addr, role_override)
+            .map(|handle| ConnectionHandler::select(handle, OneShotHandler::default()));
+    }
+
+    fn handle_pending_outbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        maybe_peer: Option<PeerId>,
+        addresses: &[Multiaddr],
+        effective_role: Endpoint,
+    ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        self.inner.handle_pending_outbound_connection(
+            connection_id,
+            maybe_peer,
+            addresses,
+            effective_role,
+        )
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm<Self::ConnectionHandler>) {
@@ -420,31 +473,29 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             }
             FromSwarm::DialFailure(DialFailure {
                 peer_id,
-                handler,
                 error,
+                connection_id,
             }) => {
-                #[cfg(feature = "compat")]
-                let (handler, _oneshot) = handler.into_inner();
                 self.inner
                     .on_swarm_event(FromSwarm::DialFailure(DialFailure {
                         peer_id,
-                        handler,
                         error,
+                        connection_id,
                     }));
             }
             FromSwarm::AddressChange(ev) => self.inner.on_swarm_event(FromSwarm::AddressChange(ev)),
             FromSwarm::ListenFailure(ListenFailure {
                 local_addr,
                 send_back_addr,
-                handler,
+                error,
+                connection_id,
             }) => {
-                #[cfg(feature = "compat")]
-                let (handler, _oneshot) = handler.into_inner();
                 self.inner
                     .on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
                         local_addr,
                         send_back_addr,
-                        handler,
+                        error,
+                        connection_id,
                     }));
             }
             FromSwarm::NewListener(ev) => self.inner.on_swarm_event(FromSwarm::NewListener(ev)),
@@ -476,10 +527,8 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         return self.inner.on_connection_handler_event(peer_id, conn, event);
         #[cfg(feature = "compat")]
         match event {
-            EitherOutput::First(event) => {
-                self.inner.on_connection_handler_event(peer_id, conn, event)
-            }
-            EitherOutput::Second(msg) => {
+            Either::Left(event) => self.inner.on_connection_handler_event(peer_id, conn, event),
+            Either::Right(msg) => {
                 for msg in msg.0 {
                     match msg {
                         CompatMessage::Request(req) => {
@@ -500,7 +549,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         &mut self,
         cx: &mut Context,
         pp: &mut impl PollParameters,
-    ) -> Poll<NetworkBehaviourAction<Self::OutEvent, Self::ConnectionHandler>> {
+    ) -> Poll<NetworkBehaviourAction<Self::OutEvent, THandlerInEvent<Self>>> {
         let mut exit = false;
         while !exit {
             exit = true;
@@ -517,7 +566,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
                                 peer_id,
                                 handler: NotifyHandler::Any,
-                                event: EitherOutput::Second(compat),
+                                event: Either::Right(compat),
                             });
                         }
                     },
@@ -581,10 +630,8 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                 exit = false;
                 let event = match event {
                     NetworkBehaviourAction::GenerateEvent(event) => event,
-                    NetworkBehaviourAction::Dial { opts, handler } => {
-                        #[cfg(feature = "compat")]
-                        let handler = ConnectionHandler::select(handler, Default::default());
-                        return Poll::Ready(NetworkBehaviourAction::Dial { opts, handler });
+                    NetworkBehaviourAction::Dial { opts } => {
+                        return Poll::Ready(NetworkBehaviourAction::Dial { opts });
                     }
                     NetworkBehaviourAction::NotifyHandler {
                         peer_id,
@@ -597,7 +644,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             #[cfg(not(feature = "compat"))]
                             event,
                             #[cfg(feature = "compat")]
-                            event: EitherOutput::First(event),
+                            event: Either::Left(event),
                         });
                     }
                     NetworkBehaviourAction::ReportObservedAddr { address, score } => {
@@ -652,9 +699,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                     return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
                                         peer_id: peer,
                                         handler: NotifyHandler::Any,
-                                        event: EitherOutput::Second(CompatMessage::Request(
-                                            request,
-                                        )),
+                                        event: Either::Right(CompatMessage::Request(request)),
                                     });
                                 }
                             }

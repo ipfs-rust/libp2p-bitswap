@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libipld::cid::Cid;
 use libipld::store::StoreParams;
-use libp2p::request_response::{ProtocolName, RequestResponseCodec};
+use libp2p::request_response::{ProtocolName, Codec};
 use std::convert::TryFrom;
 use std::io::{self, Write};
 use std::marker::PhantomData;
@@ -39,7 +39,7 @@ impl<P: StoreParams> Default for BitswapCodec<P> {
 }
 
 #[async_trait]
-impl<P: StoreParams> RequestResponseCodec for BitswapCodec<P> {
+impl<P: StoreParams> Codec for BitswapCodec<P> {
     type Protocol = BitswapProtocol;
     type Request = BitswapRequest;
     type Response = BitswapResponse;
