@@ -11,4 +11,5 @@ mod query;
 mod stats;
 
 pub use crate::behaviour::{Bitswap, BitswapConfig, BitswapEvent, BitswapStore, Channel};
+pub use crate::protocol::{BitswapRequest, BitswapResponse};
 pub use crate::query::QueryId;
