@@ -21,8 +21,8 @@ use futures::{
     task::{Context, Poll},
 };
 use libipld::{error::BlockNotFound, store::StoreParams, Block, Cid, Result};
-
-use libp2p::core::{Endpoint, Multiaddr, PeerId};
+use libp2p::core::{Endpoint, Multiaddr};
+use libp2p::identity::PeerId;
 
 #[cfg(feature = "compat")]
 use libp2p::swarm::derive_prelude::Either;

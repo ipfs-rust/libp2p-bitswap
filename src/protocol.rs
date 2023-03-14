@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libipld::cid::Cid;
 use libipld::store::StoreParams;
-use libp2p::request_response::{ProtocolName, Codec};
+use libp2p::request_response::{Codec, ProtocolName};
 use std::convert::TryFrom;
 use std::io::{self, Write};
 use std::marker::PhantomData;
