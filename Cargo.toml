@@ -37,6 +37,7 @@ libp2p = { version = "0.51.0", features = [
     "noise",
     "yamux",
     "rsa",
+    "ed25519",
     "async-std",
 ] }
 multihash = { version = "0.17.0", default-features = false, features = [
