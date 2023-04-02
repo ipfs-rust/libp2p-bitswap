@@ -39,7 +39,7 @@ use libp2p::{
         Event as RequestResponseEvent, InboundFailure, Message as RequestResponseMessage,
         OutboundFailure, ProtocolSupport, RequestId, ResponseChannel,
     },
-    swarm::{ConnectionHandler, NetworkBehaviour, NetworkBehaviourAction, PollParameters},
+    swarm::{ConnectionHandler, NetworkBehaviour, PollParameters, ToSwarm},
 };
 use prometheus::Registry;
 use std::{pin::Pin, time::Duration};
@@ -549,7 +549,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         &mut self,
         cx: &mut Context,
         pp: &mut impl PollParameters,
-    ) -> Poll<NetworkBehaviourAction<Self::OutEvent, THandlerInEvent<Self>>> {
+    ) -> Poll<ToSwarm<Self::OutEvent, THandlerInEvent<Self>>> {
         let mut exit = false;
         while !exit {
             exit = true;
@@ -563,7 +563,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         #[cfg(feature = "compat")]
                         BitswapChannel::Compat(peer_id, cid) => {
                             let compat = CompatMessage::Response(cid, response);
-                            return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                            return Poll::Ready(ToSwarm::NotifyHandler {
                                 peer_id,
                                 handler: NotifyHandler::Any,
                                 event: Either::Right(compat),
@@ -579,7 +579,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         Err(err) => {
                             self.query_manager.cancel(id);
                             let event = BitswapEvent::Complete(id, Err(err));
-                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                            return Poll::Ready(ToSwarm::GenerateEvent(event));
                         }
                     },
                 }
@@ -612,7 +612,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     },
                     QueryEvent::Progress(id, missing) => {
                         let event = BitswapEvent::Progress(id, missing);
-                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                        return Poll::Ready(ToSwarm::GenerateEvent(event));
                     }
                     QueryEvent::Complete(id, res) => {
                         if res.is_err() {
@@ -622,23 +622,23 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             id,
                             res.map_err(|cid| BlockNotFound(cid).into()),
                         );
-                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                        return Poll::Ready(ToSwarm::GenerateEvent(event));
                     }
                 }
             }
             while let Poll::Ready(event) = self.inner.poll(cx, pp) {
                 exit = false;
                 let event = match event {
-                    NetworkBehaviourAction::GenerateEvent(event) => event,
-                    NetworkBehaviourAction::Dial { opts } => {
-                        return Poll::Ready(NetworkBehaviourAction::Dial { opts });
+                    ToSwarm::GenerateEvent(event) => event,
+                    ToSwarm::Dial { opts } => {
+                        return Poll::Ready(ToSwarm::Dial { opts });
                     }
-                    NetworkBehaviourAction::NotifyHandler {
+                    ToSwarm::NotifyHandler {
                         peer_id,
                         handler,
                         event,
                     } => {
-                        return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                        return Poll::Ready(ToSwarm::NotifyHandler {
                             peer_id,
                             handler,
                             #[cfg(not(feature = "compat"))]
@@ -647,17 +647,14 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             event: Either::Left(event),
                         });
                     }
-                    NetworkBehaviourAction::ReportObservedAddr { address, score } => {
-                        return Poll::Ready(NetworkBehaviourAction::ReportObservedAddr {
-                            address,
-                            score,
-                        });
+                    ToSwarm::ReportObservedAddr { address, score } => {
+                        return Poll::Ready(ToSwarm::ReportObservedAddr { address, score });
                     }
-                    NetworkBehaviourAction::CloseConnection {
+                    ToSwarm::CloseConnection {
                         peer_id,
                         connection,
                     } => {
-                        return Poll::Ready(NetworkBehaviourAction::CloseConnection {
+                        return Poll::Ready(ToSwarm::CloseConnection {
                             peer_id,
                             connection,
                         });
@@ -696,7 +693,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                     self.requests.insert(BitswapId::Compat(info.cid), id);
                                     tracing::trace!("adding compat peer {}", peer);
                                     self.compat.insert(peer);
-                                    return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                                    return Poll::Ready(ToSwarm::NotifyHandler {
                                         peer_id: peer,
                                         handler: NotifyHandler::Any,
                                         event: Either::Right(CompatMessage::Request(request)),
@@ -738,7 +735,7 @@ mod tests {
     use libp2p::core::transport::Boxed;
     use libp2p::identity;
     use libp2p::noise::{Keypair, NoiseConfig, X25519Spec};
-    use libp2p::swarm::SwarmEvent;
+    use libp2p::swarm::{SwarmBuilder, SwarmEvent};
     use libp2p::tcp::{self, async_io};
     use libp2p::yamux::YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
@@ -819,11 +816,12 @@ mod tests {
         fn new() -> Self {
             let (peer_id, trans) = mk_transport();
             let store = Store::default();
-            let mut swarm = Swarm::with_async_std_executor(
+            let mut swarm = SwarmBuilder::with_async_std_executor(
                 trans,
                 Bitswap::new(BitswapConfig::new(), store.clone()),
                 peer_id,
-            );
+            )
+            .build();
             Swarm::listen_on(&mut swarm, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
             while swarm.next().now_or_never().is_some() {}
             let addr = Swarm::listeners(&swarm).next().unwrap().clone();
