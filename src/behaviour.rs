@@ -5,10 +5,11 @@
 //!
 //! The `Bitswap` struct implements the `NetworkBehaviour` trait. When used, it
 //! will allow providing and reciving IPFS blocks.
+
+#[cfg(feature = "compat")]
+use either::Either;
 #[cfg(feature = "compat")]
 use fnv::FnvHashSet;
-#[cfg(feature = "compat")]
-use libp2p::core::either::EitherOutput;
 #[cfg(feature = "compat")]
 use libp2p::swarm::{ConnectionHandlerSelect, NotifyHandler, OneShotHandler};
 use {
@@ -541,8 +542,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         error,
         connection_id,
       }) => {
-        #[cfg(feature = "compat")]
-        let (handler, _oneshot) = handler.into_inner();
         self
           .inner
           .on_swarm_event(FromSwarm::DialFailure(DialFailure {
@@ -560,8 +559,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         error,
         connection_id,
       }) => {
-        #[cfg(feature = "compat")]
-        let (handler, _oneshot) = handler.into_inner();
         self
           .inner
           .on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
@@ -606,10 +603,10 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     return self.inner.on_connection_handler_event(peer_id, conn, event);
     #[cfg(feature = "compat")]
     match event {
-      EitherOutput::First(event) => {
+      Either::Left(event) => {
         self.inner.on_connection_handler_event(peer_id, conn, event)
       }
-      EitherOutput::Second(msg) => {
+      Either::Right(msg) => {
         for msg in msg.0 {
           match msg {
             CompatMessage::Request(req) => {
@@ -647,10 +644,10 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             #[cfg(feature = "compat")]
             BitswapChannel::Compat(peer_id, cid) => {
               let compat = CompatMessage::Response(cid, response);
-              return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+              return Poll::Ready(ToSwarm::NotifyHandler {
                 peer_id,
                 handler: NotifyHandler::Any,
-                event: EitherOutput::Second(compat),
+                event: Either::Right(compat),
               });
             }
           },
@@ -717,9 +714,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         let event = match event {
           ToSwarm::GenerateEvent(event) => event,
           ToSwarm::Dial { opts } => {
-            #[cfg(feature = "compat")]
-            let handler =
-              ConnectionHandler::select(handler, Default::default());
             return Poll::Ready(ToSwarm::Dial { opts });
           }
           ToSwarm::NotifyHandler {
@@ -733,7 +727,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
               #[cfg(not(feature = "compat"))]
               event,
               #[cfg(feature = "compat")]
-              event: EitherOutput::First(event),
+              event: Either::Left(event),
             });
           }
           ToSwarm::ReportObservedAddr { address, score } => {
@@ -787,12 +781,10 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                   self.requests.insert(BitswapId::Compat(info.cid), id);
                   tracing::trace!("adding compat peer {}", peer);
                   self.compat.insert(peer);
-                  return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                  return Poll::Ready(ToSwarm::NotifyHandler {
                     peer_id: peer,
                     handler: NotifyHandler::Any,
-                    event: EitherOutput::Second(CompatMessage::Request(
-                      request,
-                    )),
+                    event: Either::Right(CompatMessage::Request(request)),
                   });
                 }
               }

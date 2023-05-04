@@ -15,6 +15,7 @@ prost-build = { version = "0.11", optional = true }
 
 [dependencies]
 async-trait = "0.1.52"
+either = "1.8.1"
 fnv = "1.0.7"
 futures = "0.3.19"
 lazy_static = "1.4.0"
@@ -31,5 +32,5 @@ async-std = { version = "1.10.0", features = ["attributes"] }
 env_logger = "0.9.0"
 libipld = { version = "0.16.0", default-features = false, features = ["dag-cbor"] }
 libp2p = { version = "0.51.3", features = ["tcp", "noise", "yamux", "rsa", "async-std"] }
-multihash = { version = "0.17", default-features = false, features = ["blake3", "sha2"] }
+multihash = { version = "0.18", default-features = false, features = ["blake3", "sha2"] }
 tracing-subscriber = { version = "0.3.5", features = ["env-filter", "tracing-log"] }
