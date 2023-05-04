@@ -18,8 +18,8 @@ async-trait = "0.1.52"
 fnv = "1.0.7"
 futures = "0.3.19"
 lazy_static = "1.4.0"
-libipld = { version = "0.15.0", default-features = false }
-libp2p = { version = "0.50.0", features = ["request-response"] }
+libipld = { version = "0.16.0", default-features = false }
+libp2p = { version = "0.51.3", features = ["request-response"] }
 prometheus = "0.13.0"
 prost = { version = "0.11", optional = true }
 thiserror = "1.0.30"
@@ -29,7 +29,7 @@ unsigned-varint = { version = "0.7.1", features = ["futures", "std"] }
 [dev-dependencies]
 async-std = { version = "1.10.0", features = ["attributes"] }
 env_logger = "0.9.0"
-libipld = { version = "0.15.0", default-features = false, features = ["dag-cbor"] }
-libp2p = { version = "0.50.0", features = ["tcp", "noise", "yamux", "rsa", "async-std"] }
-multihash = { version = "0.17.0", default-features = false, features = ["blake3", "sha2"] }
+libipld = { version = "0.16.0", default-features = false, features = ["dag-cbor"] }
+libp2p = { version = "0.51.3", features = ["tcp", "noise", "yamux", "rsa", "async-std"] }
+multihash = { version = "0.17", default-features = false, features = ["blake3", "sha2"] }
 tracing-subscriber = { version = "0.3.5", features = ["env-filter", "tracing-log"] }
