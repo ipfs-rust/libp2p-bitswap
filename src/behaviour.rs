@@ -26,9 +26,7 @@ use libp2p::core::either::EitherOutput;
 use libp2p::core::{connection::ConnectionId, Multiaddr, PeerId};
 use libp2p::swarm::derive_prelude::{ConnectionClosed, DialFailure, FromSwarm, ListenFailure};
 #[cfg(feature = "compat")]
-use libp2p::swarm::SubstreamProtocol;
-#[cfg(feature = "compat")]
-use libp2p::swarm::{ConnectionHandlerSelect, NotifyHandler, OneShotHandler};
+use libp2p::swarm::{ConnectionHandlerSelect, NotifyHandler, OneShotHandler, SubstreamProtocol};
 use libp2p::{
     request_response::{
         InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse,
