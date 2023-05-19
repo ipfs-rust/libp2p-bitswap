@@ -131,13 +131,17 @@ pub enum RequestType {
     Block,
 }
 
+/// A request sent to another peer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BitswapRequest {
+    /// type of request: have or block
     pub ty: RequestType,
+    /// CID the request is for
     pub cid: Cid,
 }
 
 impl BitswapRequest {
+    /// write binary representation of the request
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         match self {
             BitswapRequest {
@@ -158,6 +162,7 @@ impl BitswapRequest {
         Ok(())
     }
 
+    /// read back binary representation of the request
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
         let ty = match bytes[0] {
             0 => RequestType::Have,
@@ -169,13 +174,17 @@ impl BitswapRequest {
     }
 }
 
+/// Response to a [BitswapRequest]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BitswapResponse {
+    /// block presence
     Have(bool),
+    /// block bytes
     Block(Vec<u8>),
 }
 
 impl BitswapResponse {
+    /// write binary representation of the request
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         match self {
             BitswapResponse::Have(have) => {
@@ -193,6 +202,7 @@ impl BitswapResponse {
         Ok(())
     }
 
+    /// read back binary representation of the request
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
         let res = match bytes[0] {
             0 | 2 => BitswapResponse::Have(bytes[0] == 0),
