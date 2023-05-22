@@ -734,10 +734,10 @@ mod tests {
     use libp2p::core::muxing::StreamMuxerBox;
     use libp2p::core::transport::Boxed;
     use libp2p::identity;
-    use libp2p::noise::{Keypair, NoiseConfig, X25519Spec};
+    use libp2p::noise::Config;
     use libp2p::swarm::{SwarmBuilder, SwarmEvent};
     use libp2p::tcp::{self, async_io};
-    use libp2p::yamux::YamuxConfig;
+    use libp2p::yamux::Config as YamuxConfig;
     use libp2p::{PeerId, Swarm, Transport};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -754,10 +754,7 @@ mod tests {
     fn mk_transport() -> (PeerId, Boxed<(PeerId, StreamMuxerBox)>) {
         let id_key = identity::Keypair::generate_ed25519();
         let peer_id = id_key.public().to_peer_id();
-        let dh_key = Keypair::<X25519Spec>::new()
-            .into_authentic(&id_key)
-            .unwrap();
-        let noise = NoiseConfig::xx(dh_key).into_authenticated();
+        let noise = Config::new(&id_key).unwrap();
 
         let transport = async_io::Transport::new(tcp::Config::new().nodelay(true))
             .upgrade(libp2p::core::upgrade::Version::V1)
