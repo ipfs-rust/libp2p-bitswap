@@ -8,7 +8,7 @@
 #[cfg(feature = "compat")]
 use crate::compat::{CompatMessage, CompatProtocol, InboundMessage};
 use crate::protocol::{
-    BitswapCodec, BitswapProtocol, BitswapRequest, BitswapResponse, RequestType,
+    BitswapCodec, BitswapRequest, BitswapResponse, RequestType, LIBP2P_BITSWAP_PROTOCOL,
 };
 use crate::query::{QueryEvent, QueryId, QueryManager, Request, Response};
 use crate::stats::*;
@@ -133,8 +133,8 @@ impl<P: StoreParams> Bitswap<P> {
         let mut rr_config = RequestResponseConfig::default();
         rr_config.set_connection_keep_alive(config.connection_keep_alive);
         rr_config.set_request_timeout(config.request_timeout);
-        let protocols = std::iter::once((BitswapProtocol, ProtocolSupport::Full));
-        let inner = RequestResponse::new(BitswapCodec::<P>::default(), protocols, rr_config);
+        let protocols = std::iter::once((LIBP2P_BITSWAP_PROTOCOL, ProtocolSupport::Full));
+        let inner = RequestResponse::new(protocols, rr_config);
         let (db_tx, db_rx) = start_db_thread(store);
         Self {
             inner,
@@ -385,7 +385,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ConnectionHandler,
         OneShotHandler<CompatProtocol, CompatMessage, InboundMessage>,
     >;
-    type OutEvent = BitswapEvent;
+    type ToSwarm = BitswapEvent;
 
     fn handle_established_inbound_connection(
         &mut self,
@@ -507,12 +507,15 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             FromSwarm::ListenerClosed(ev) => {
                 self.inner.on_swarm_event(FromSwarm::ListenerClosed(ev))
             }
-            FromSwarm::NewExternalAddr(ev) => {
-                self.inner.on_swarm_event(FromSwarm::NewExternalAddr(ev))
-            }
-            FromSwarm::ExpiredExternalAddr(ev) => self
+            FromSwarm::NewExternalAddrCandidate(ev) => self
                 .inner
-                .on_swarm_event(FromSwarm::ExpiredExternalAddr(ev)),
+                .on_swarm_event(FromSwarm::NewExternalAddrCandidate(ev)),
+            FromSwarm::ExternalAddrConfirmed(ev) => self
+                .inner
+                .on_swarm_event(FromSwarm::ExternalAddrConfirmed(ev)),
+            FromSwarm::ExternalAddrExpired(ev) => self
+                .inner
+                .on_swarm_event(FromSwarm::ExternalAddrExpired(ev)),
         }
     }
 
@@ -520,7 +523,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         &mut self,
         peer_id: PeerId,
         conn: ConnectionId,
-        event: <Self::ConnectionHandler as ConnectionHandler>::OutEvent,
+        event: <Self::ConnectionHandler as ConnectionHandler>::ToBehaviour,
     ) {
         tracing::trace!(?event, "on_connection_handler_event");
         #[cfg(not(feature = "compat"))]
@@ -549,7 +552,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         &mut self,
         cx: &mut Context,
         pp: &mut impl PollParameters,
-    ) -> Poll<ToSwarm<Self::OutEvent, THandlerInEvent<Self>>> {
+    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         let mut exit = false;
         while !exit {
             exit = true;
@@ -647,8 +650,20 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             event: Either::Left(event),
                         });
                     }
-                    ToSwarm::ReportObservedAddr { address, score } => {
-                        return Poll::Ready(ToSwarm::ReportObservedAddr { address, score });
+                    ToSwarm::ListenOn { opts } => {
+                        return Poll::Ready(ToSwarm::ListenOn { opts });
+                    }
+                    ToSwarm::RemoveListener { id } => {
+                        return Poll::Ready(ToSwarm::RemoveListener { id });
+                    }
+                    ToSwarm::NewExternalAddrCandidate(address) => {
+                        return Poll::Ready(ToSwarm::NewExternalAddrCandidate(address));
+                    }
+                    ToSwarm::ExternalAddrConfirmed(address) => {
+                        return Poll::Ready(ToSwarm::ExternalAddrConfirmed(address));
+                    }
+                    ToSwarm::ExternalAddrExpired(address) => {
+                        return Poll::Ready(ToSwarm::ExternalAddrExpired(address));
                     }
                     ToSwarm::CloseConnection {
                         peer_id,
