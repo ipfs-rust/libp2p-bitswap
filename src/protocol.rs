@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libipld::cid::Cid;
 use libipld::store::StoreParams;
-use libp2p::request_response::{ProtocolName, RequestResponseCodec};
+use libp2p::request_response::Codec;
+use libp2p::StreamProtocol;
 use std::convert::TryFrom;
 use std::io::{self, Write};
 use std::marker::PhantomData;
@@ -12,14 +13,8 @@ use unsigned_varint::{aio, io::ReadError};
 // version codec hash size (u64 varint is max 10 bytes) + digest
 const MAX_CID_SIZE: usize = 4 * 10 + 64;
 
-#[derive(Clone, Debug)]
-pub struct BitswapProtocol;
-
-impl ProtocolName for BitswapProtocol {
-    fn protocol_name(&self) -> &[u8] {
-        b"/ipfs-embed/bitswap/1.0.0"
-    }
-}
+pub(crate) const LIBP2P_BITSWAP_PROTOCOL: StreamProtocol =
+    StreamProtocol::new("/ipfs-embed/bitswap/1.0.0");
 
 #[derive(Clone)]
 pub struct BitswapCodec<P> {
@@ -39,8 +34,8 @@ impl<P: StoreParams> Default for BitswapCodec<P> {
 }
 
 #[async_trait]
-impl<P: StoreParams> RequestResponseCodec for BitswapCodec<P> {
-    type Protocol = BitswapProtocol;
+impl<P: StoreParams> Codec for BitswapCodec<P> {
+    type Protocol = StreamProtocol;
     type Request = BitswapRequest;
     type Response = BitswapResponse;
 

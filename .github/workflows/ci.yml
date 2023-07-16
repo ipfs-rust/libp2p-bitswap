@@ -60,11 +60,6 @@ jobs:
             target/
           key: ${{ matrix.platform.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install dependencies ubuntu
         if: matrix.platform.host == 'ubuntu-latest'
         run: sudo apt-get install llvm-dev
@@ -141,11 +136,6 @@ jobs:
           toolchain: stable
           profile: minimal
           components: clippy, rustfmt
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: cargo fmt
         uses: actions-rs/cargo@v1

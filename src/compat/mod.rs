@@ -1,4 +1,5 @@
 mod message;
+mod pb;
 mod prefix;
 mod protocol;
 
