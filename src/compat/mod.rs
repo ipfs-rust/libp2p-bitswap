@@ -1,7 +1,7 @@
 mod message;
+mod pb;
 mod prefix;
 mod protocol;
-mod pb;
 
 pub use message::CompatMessage;
 pub use protocol::{CompatProtocol, InboundMessage};

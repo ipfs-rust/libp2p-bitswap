@@ -13,7 +13,8 @@ use unsigned_varint::{aio, io::ReadError};
 // version codec hash size (u64 varint is max 10 bytes) + digest
 const MAX_CID_SIZE: usize = 4 * 10 + 64;
 
-pub(crate) const LIBP2P_BITSWAP_PROTOCOL: StreamProtocol = StreamProtocol::new("/ipfs-embed/bitswap/1.0.0");
+pub(crate) const LIBP2P_BITSWAP_PROTOCOL: StreamProtocol =
+    StreamProtocol::new("/ipfs-embed/bitswap/1.0.0");
 
 #[derive(Clone)]
 pub struct BitswapCodec<P> {

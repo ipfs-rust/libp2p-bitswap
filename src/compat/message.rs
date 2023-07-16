@@ -79,12 +79,8 @@ impl CompatMessage {
             }
             let cid = Cid::try_from(&*entry.block).map_err(other)?;
             let ty = match entry.wantType {
-                ty if bitswap_pb::message::wantlist::WantType::Have == ty => {
-                    RequestType::Have
-                }
-                ty if bitswap_pb::message::wantlist::WantType::Block == ty => {
-                    RequestType::Block
-                }
+                ty if bitswap_pb::message::wantlist::WantType::Have == ty => RequestType::Have,
+                ty if bitswap_pb::message::wantlist::WantType::Block == ty => RequestType::Block,
                 _ => {
                     tracing::error!("invalid request type: skipping");
                     continue;
