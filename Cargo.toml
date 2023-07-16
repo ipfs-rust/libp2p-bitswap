@@ -30,22 +30,7 @@ quick-protobuf = { version = "0.8.1", optional = true }
 [dev-dependencies]
 async-std = { version = "1.10.0", features = ["attributes"] }
 env_logger = "0.9.0"
-libipld = { version = "0.15.0", default-features = false, features = [
-    "dag-cbor",
-] }
-libp2p = { version = "0.52", features = [
-    "tcp",
-    "noise",
-    "yamux",
-    "rsa",
-    "ed25519",
-    "async-std",
-] }
-multihash = { version = "0.17.0", default-features = false, features = [
-    "blake3",
-    "sha2",
-] }
-tracing-subscriber = { version = "0.3.5", features = [
-    "env-filter",
-    "tracing-log",
-] }
+libipld = { version = "0.15.0", default-features = false, features = ["dag-cbor"] }
+libp2p = { version = "0.52", features = ["tcp", "noise", "yamux", "rsa", "ed25519", "async-std"] }
+multihash = { version = "0.17.0", default-features = false, features = ["blake3", "sha2"] }
+tracing-subscriber = { version = "0.3.5", features = ["env-filter","tracing-log"] }
